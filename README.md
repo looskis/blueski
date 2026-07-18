@@ -28,11 +28,10 @@ blueski setup
 blueski install
 ```
 
-Until the first versioned release is published, the included head-only Homebrew
-formula can be tested from a checkout:
+Install the current release with Homebrew:
 
 ```sh
-brew install --HEAD --formula ./Formula/blueski.rb
+brew install looskis/tap/blueski
 blueski setup
 brew services start blueski
 ```
@@ -120,14 +119,14 @@ requires working Messages permissions.
 
 ## Homebrew release checklist
 
-`Formula/blueski.rb` is a usable head formula and includes a `brew services`
-definition. For a versioned release:
+The canonical formula lives in `looskis/homebrew-tap` and includes stable and
+head builds plus a `brew services` definition. For each new version:
 
 1. Tag `vX.Y.Z`; the release workflow uploads a deterministic source archive
    and SHA-256 file.
-2. Add the release asset URL and SHA-256 to the formula.
-3. Copy the formula to `looskis/homebrew-tap/Formula/blueski.rb`.
-4. Run `brew audit --strict --online blueski`,
+2. Update the release asset URL and SHA-256 in
+   `looskis/homebrew-tap/Formula/blueski.rb`.
+3. Run `brew audit --strict --online blueski`,
    `brew install --build-from-source blueski`, and `brew test blueski`.
 
 Homebrew recommends a separate `homebrew-` repository for short tap names; see

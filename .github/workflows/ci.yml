@@ -19,4 +19,3 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: bash -n scripts/*.sh
-      - run: ruby -c Formula/blueski.rb

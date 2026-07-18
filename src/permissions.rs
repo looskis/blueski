@@ -71,7 +71,9 @@ pub fn run_setup(chatdb: &Path) {
             auto_done = true;
         }
         if fda_done && auto_done {
-            println!("\nAll set. Run `blueski install` to start the agent.");
+            println!("\nAll set. Start Blueski with one supervisor:");
+            println!("  Homebrew: `brew services start blueski`");
+            println!("  Built-in: `blueski install`");
             return;
         }
         std::thread::sleep(Duration::from_secs(2));
