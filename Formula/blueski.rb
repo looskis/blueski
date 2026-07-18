@@ -1,8 +1,8 @@
 class Blueski < Formula
   desc "AppleScript-only macOS Messages send/receive daemon"
-  homepage "https://github.com/raz-team/blueski"
+  homepage "https://github.com/looskis/blueski"
   license "MIT"
-  head "https://github.com/raz-team/blueski.git", branch: "main"
+  head "https://github.com/looskis/blueski.git", branch: "main"
 
   depends_on "rust" => :build
   depends_on macos: :monterey

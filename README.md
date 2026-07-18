@@ -126,7 +126,7 @@ definition. For a versioned release:
 1. Tag `vX.Y.Z`; the release workflow uploads a deterministic source archive
    and SHA-256 file.
 2. Add the release asset URL and SHA-256 to the formula.
-3. Copy the formula to `raz-team/homebrew-tap/Formula/blueski.rb`.
+3. Copy the formula to `looskis/homebrew-tap/Formula/blueski.rb`.
 4. Run `brew audit --strict --online blueski`,
    `brew install --build-from-source blueski`, and `brew test blueski`.
 
