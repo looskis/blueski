@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/blueski-icon.png" alt="Blueski logo" width="128" height="128">
+</p>
+
 # Blueski
 
 Blueski is a small, AppleScript-only macOS daemon for sending and receiving
