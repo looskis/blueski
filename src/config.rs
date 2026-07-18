@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// launchd label / bundle id.
-pub const LABEL: &str = "com.razteam.blueski";
+pub const LABEL: &str = "com.looskis.blueski";
 
 fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").expect("HOME not set"))

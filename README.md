@@ -39,8 +39,9 @@ brew services start blueski
 `blueski install` installs its own per-user LaunchAgent. Do not use it at the
 same time as `brew services`; choose one supervisor.
 
-For local development, `scripts/bundle.sh` creates `dist/Blueski.app`. Set
-`SIGN_ID` to a stable signing identity if you want TCC grants to survive builds.
+For local development, `scripts/bundle.sh` creates `dist/Blueski.app` with the
+Blueski icon and bundle identity. Set `SIGN_ID` to a stable signing identity if
+you want TCC grants to survive builds.
 
 ## Use
 

@@ -10,9 +10,10 @@ cd "$(dirname "$0")/.."
 PROFILE="${1:-debug}"
 BIN_NAME="blueski"
 APP_DISPLAY="Blueski"
-IDENTIFIER="com.razteam.blueski"
+IDENTIFIER="com.looskis.blueski"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
 SIGN_ID="${SIGN_ID:--}"
+LOGO="${LOGO:-assets/blueski-icon.png}"
 
 APP="dist/${APP_DISPLAY}.app"
 CONTENTS="$APP/Contents"
@@ -26,8 +27,18 @@ else
 fi
 
 rm -rf "$APP"
-mkdir -p "$CONTENTS/MacOS"
+mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 cp "$BIN" "$CONTENTS/MacOS/$BIN_NAME"
+
+ICONSET="dist/AppIcon.iconset"
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+for size in 16 32 128 256 512; do
+  sips -z "$size" "$size" "$LOGO" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+  retina_size=$((size * 2))
+  sips -z "$retina_size" "$retina_size" "$LOGO" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/AppIcon.icns"
 
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -38,11 +49,14 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key>          <string>${APP_DISPLAY}</string>
     <key>CFBundleIdentifier</key>           <string>${IDENTIFIER}</string>
     <key>CFBundleExecutable</key>           <string>${BIN_NAME}</string>
+    <key>CFBundleIconFile</key>             <string>AppIcon</string>
     <key>CFBundlePackageType</key>          <string>APPL</string>
     <key>CFBundleShortVersionString</key>   <string>${VERSION}</string>
     <key>CFBundleVersion</key>              <string>${VERSION}</string>
     <key>LSMinimumSystemVersion</key>       <string>12.0</string>
     <key>LSUIElement</key>                  <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Blueski uses Automation to send messages through Messages.</string>
 </dict>
 </plist>
 PLIST
