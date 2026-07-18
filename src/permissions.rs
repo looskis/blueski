@@ -3,7 +3,7 @@
 //! right System Settings pane.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const PANE_FULL_DISK: &str =
@@ -38,6 +38,25 @@ fn open_pane(url: &str) {
     let _ = std::process::Command::new("open").arg(url).status();
 }
 
+fn enclosing_app(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|ancestor| ancestor.extension().is_some_and(|ext| ext == "app"))
+}
+
+fn full_disk_access_target() -> PathBuf {
+    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("blueski"));
+    enclosing_app(&executable)
+        .unwrap_or(&executable)
+        .to_path_buf()
+}
+
+fn reveal_in_finder(path: &Path) {
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .status();
+}
+
 /// Interactive setup: open the relevant panes and block until both grants land.
 pub fn run_setup(chatdb: &Path) {
     println!("blueski setup — granting macOS permissions\n");
@@ -45,8 +64,16 @@ pub fn run_setup(chatdb: &Path) {
     if has_full_disk_access(chatdb) {
         println!("  [ok] Full Disk Access");
     } else {
+        let target = full_disk_access_target();
         println!("  [..] Full Disk Access — opening System Settings");
-        println!("       Add 'blueski' under Privacy & Security > Full Disk Access.");
+        if target.extension().is_some_and(|ext| ext == "app") {
+            println!("       Add 'Blueski.app' under Privacy & Security > Full Disk Access.");
+            println!("       App: {}", target.display());
+            reveal_in_finder(&target);
+        } else {
+            println!("       Add this executable under Privacy & Security > Full Disk Access.");
+            println!("       Executable: {}", target.display());
+        }
         open_pane(PANE_FULL_DISK);
     }
 
@@ -77,5 +104,29 @@ pub fn run_setup(chatdb: &Path) {
             return;
         }
         std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enclosing_app;
+    use std::path::Path;
+
+    #[test]
+    fn finds_enclosing_app_bundle() {
+        let executable =
+            Path::new("/opt/homebrew/Cellar/blueski/0.1.1/Blueski.app/Contents/MacOS/blueski");
+        assert_eq!(
+            enclosing_app(executable),
+            Some(Path::new("/opt/homebrew/Cellar/blueski/0.1.1/Blueski.app"))
+        );
+    }
+
+    #[test]
+    fn leaves_source_builds_without_an_app_bundle() {
+        assert_eq!(
+            enclosing_app(Path::new("/tmp/blueski/target/debug/blueski")),
+            None
+        );
     }
 }
