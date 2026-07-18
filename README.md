@@ -92,7 +92,7 @@ same events are POSTed with an `X-Blueski-Signature` HMAC-SHA256 header.
 The first command creates `~/.config/blueski/config.toml`:
 
 ```toml
-port = 8787
+port = 8788
 webhook_url = "https://example.com/blueski/events" # optional
 hmac_secret = "replace-me"
 ```

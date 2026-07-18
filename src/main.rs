@@ -191,6 +191,13 @@ fn ensure_running(config: &Config) -> Result<()> {
     if probe(&url).is_some() {
         return Ok(());
     }
+    if probe_status(&url).is_some() {
+        anyhow::bail!(
+            "port {} is occupied by another service; change `port` in {}",
+            config.port,
+            config::config_path().display()
+        );
+    }
 
     let exe = std::env::current_exe()?;
     let out = open_log("/tmp/blueski.log")?;
@@ -383,6 +390,10 @@ fn status() -> Result<()> {
 
 /// Blocking GET of the control socket's `/status`. Returns the body on 2xx.
 fn probe(url: &str) -> Option<String> {
+    probe_status(url).filter(|body| is_blueski_status(body))
+}
+
+fn probe_status(url: &str) -> Option<String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -399,6 +410,19 @@ fn probe(url: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn is_blueski_status(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|status| {
+            status
+                .get("transport")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("applescript")
 }
 
 /// Blocking POST of a JSON body to the control socket; returns the response.
@@ -455,7 +479,7 @@ mod tests {
     fn http_success_or_error_rejects_non_2xx() {
         let err = http_success_or_error(
             "POST",
-            "http://127.0.0.1:8787/messages",
+            "http://127.0.0.1:8788/messages",
             StatusCode::SERVICE_UNAVAILABLE,
             r#"{"error":"send worker unavailable"}"#.to_string(),
         )
@@ -470,12 +494,20 @@ mod tests {
     fn http_success_or_error_returns_success_body() {
         let body = http_success_or_error(
             "POST",
-            "http://127.0.0.1:8787/messages",
+            "http://127.0.0.1:8788/messages",
             StatusCode::ACCEPTED,
             r#"{"status":"queued"}"#.to_string(),
         )
         .unwrap();
 
         assert_eq!(body, r#"{"status":"queued"}"#);
+    }
+
+    #[test]
+    fn status_probe_rejects_another_daemon_on_the_same_port() {
+        assert!(is_blueski_status(
+            r#"{"status":"ok","transport":"applescript"}"#
+        ));
+        assert!(!is_blueski_status(r#"{"status":"ok","version":"0.1.0"}"#));
     }
 }

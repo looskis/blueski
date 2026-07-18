@@ -57,7 +57,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            port: 8787,
+            port: 8788,
             webhook_url: None,
             hmac_secret: uuid::Uuid::new_v4().to_string(),
         }

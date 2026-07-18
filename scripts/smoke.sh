@@ -16,17 +16,17 @@ trap cleanup EXIT
 
 "$BIN" up >/dev/null
 RESPONSE="$("$BIN" send --to "$TEST_RECIPIENT" --text "$TEXT" --client-ref "live-smoke")"
-MESSAGE_ID="$(printf '%s' "$RESPONSE" | sed -n 's/.*"message_id":"\([^"]*\)".*/\1/p')"
+MESSAGE_ID="$(printf '%s' "$RESPONSE" | sed -n 's/.*"message_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 test -n "$MESSAGE_ID"
 
-for _ in $(seq 1 20); do
+for _ in $(seq 1 240); do
   EVENTS="$("$BIN" events --since 0)"
-  if printf '%s\n' "$EVENTS" | grep "\"message_id\":\"$MESSAGE_ID\"" | grep -q '"event":"message.sent"'; then
-    echo "message.sent $MESSAGE_ID"
+  if printf '%s\n' "$EVENTS" | grep "\"message_id\":\"$MESSAGE_ID\"" | grep '"event":"message.status"' | grep -Eq '"status":"(delivered|read)"'; then
+    echo "message delivered $MESSAGE_ID"
     exit 0
   fi
   sleep 0.5
 done
 
-echo "message.sent was not observed for $MESSAGE_ID" >&2
+echo "delivery was not observed for $MESSAGE_ID" >&2
 exit 1
