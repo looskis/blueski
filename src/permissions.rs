@@ -45,9 +45,8 @@ fn enclosing_app(path: &Path) -> Option<&Path> {
 
 fn full_disk_access_target() -> PathBuf {
     let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("blueski"));
-    enclosing_app(&executable)
-        .unwrap_or(&executable)
-        .to_path_buf()
+    let resolved = executable.canonicalize().unwrap_or(executable);
+    enclosing_app(&resolved).unwrap_or(&resolved).to_path_buf()
 }
 
 fn reveal_in_finder(path: &Path) {
