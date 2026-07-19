@@ -87,7 +87,7 @@ blueski unpublish
 blueski down
 ```
 
-`blueski down` unloads the active supervisor. The next `up`, `status`, `send`,
+`blueski down` unloads all Blueski supervisors. The next `up`, `status`, `send`,
 or `events` command loads or starts it again. `blueski doctor` is the explicit
 slow path for live AppleScript and protected-file permission probes.
 
@@ -163,8 +163,8 @@ requires working Messages permissions.
 
 ## Homebrew release checklist
 
-The canonical formula lives in `looskis/homebrew-tap` and includes stable and
-head builds plus a `brew services` definition. For each new version:
+The canonical formula lives in `looskis/homebrew-tap`, includes stable and head
+builds, and delegates supervision to `blueski setup`. For each new version:
 
 1. Tag `vX.Y.Z`; the release workflow uploads a deterministic source archive
    and SHA-256 file.
