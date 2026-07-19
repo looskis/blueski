@@ -19,8 +19,10 @@ Outbound messages always travel through `osascript` and Messages.app.
 - Automation permission to control Messages.app
 - Full Disk Access to read `~/Library/Messages/chat.db`
 
-Blueski binds only to `127.0.0.1`. It is not an authenticated network service
-and should not be exposed through a proxy without adding authentication.
+Blueski binds only to `127.0.0.1`. The local API is unauthenticated by default;
+`blueski publish` enables bearer authentication before exposing it through its
+supervised ngrok tunnel. Do not configure another proxy without equivalent
+authentication.
 
 ## Install
 
@@ -29,7 +31,6 @@ Build from source:
 ```sh
 cargo install --locked --path .
 blueski setup
-blueski install
 ```
 
 Install the current release with Homebrew:
@@ -37,11 +38,35 @@ Install the current release with Homebrew:
 ```sh
 brew install looskis/tap/blueski
 blueski setup
-brew services start blueski
 ```
 
-`blueski install` installs its own per-user LaunchAgent. Do not use it at the
-same time as `brew services`; choose one supervisor.
+`blueski setup` installs and starts a per-user LaunchAgent, verifies the
+canonical port, and walks through Full Disk Access and Messages Automation.
+When installed as an app bundle it relaunches setup through LaunchServices so
+the grants attach to Blueski's stable application identity. The command waits
+for the grants and finishes with machine-readable readiness JSON.
+
+Homebrew builds are ad-hoc signed, so macOS may require those grants again after
+an upgrade or reinstall. Run `blueski setup` again if `blueski status` reports a
+missing permission.
+
+After setup, `launchd` starts Blueski at login and restarts it after crashes.
+Every agent-facing CLI command checks the fast health endpoint and asks the OS
+supervisor to start Blueski when necessary. If Homebrew Services already owns
+the daemon, Blueski reuses that supervisor instead of installing a second one.
+
+To fully remove a Homebrew installation, stop both current and legacy
+supervisors before uninstalling the formula:
+
+```sh
+blueski uninstall
+brew services stop blueski 2>/dev/null || true
+brew uninstall looskis/tap/blueski
+```
+
+Configuration and message history remain in `~/.config/blueski` so a reinstall
+can reuse them. Remove that directory separately only if you want to erase the
+local Blueski state.
 
 For local development, `scripts/bundle.sh` creates `dist/Blueski.app` with the
 Blueski icon and bundle identity. Set `SIGN_ID` to a stable signing identity if
@@ -51,16 +76,25 @@ you want TCC grants to survive builds.
 
 ```sh
 blueski status
+blueski doctor
 blueski up
 blueski send --to "+14155551234" --text "hello"
 blueski send "+14155551234" "positional form"
 blueski events --since 0
 blueski events --follow
+blueski publish --domain blueski.example.com
+blueski unpublish
 blueski down
 ```
 
-The CLI automatically starts the daemon for `send` and `events` if it is not
-already running.
+`blueski down` unloads the active supervisor. The next `up`, `status`, `send`,
+or `events` command loads or starts it again. `blueski doctor` is the explicit
+slow path for live AppleScript and protected-file permission probes.
+
+`blueski publish` installs a second LaunchAgent for ngrok and generates an API
+bearer token before the tunnel is started. Its final JSON includes the public
+URL and `Authorization` value. Remote callers must send that header on every
+request. `blueski unpublish` removes the tunnel and disables the token.
 
 ### HTTP API
 
@@ -83,7 +117,10 @@ Use exactly one of `to` or `chat_id`. A successful queue operation returns
 
 Other endpoints:
 
-- `GET /status` — health, permissions, and `transport: "applescript"`
+- `GET /healthz` — immediate, side-effect-free liveness and product identity
+- `GET /status` — cached daemon and permission state; never invokes AppleScript
+- `GET /messages?since=<cursor>&limit=<n>` — latest journal entry per message
+- `GET /messages/:id` — complete durable lifecycle for one message
 - `GET /events?since=<cursor>&limit=<n>` — durable event journal
 - `GET /events/stream?since=<cursor>` — newline-delimited live event stream
 
@@ -99,15 +136,17 @@ The first command creates `~/.config/blueski/config.toml`:
 port = 8788
 webhook_url = "https://example.com/blueski/events" # optional
 hmac_secret = "replace-me"
+api_token = "bs_..." # generated only by `blueski publish`
 ```
 
 State lives in the same directory:
 
 - `state.json` — last observed Messages row
 - `state.db` — durable events and outbound correlation
-- `daemon.pid` — process started by `blueski up`
+- `daemon.pid` — informational PID for the launchd-owned process
 
-LaunchAgent logs are written to `/tmp/blueski.log` and `/tmp/blueski.err`.
+LaunchAgent logs are written to `blueski.log` and `blueski.err.log` in the same
+state directory.
 
 ## Development and verification
 

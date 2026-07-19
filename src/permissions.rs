@@ -4,6 +4,8 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 const PANE_FULL_DISK: &str =
@@ -23,15 +25,62 @@ pub fn has_full_disk_access(chatdb: &Path) -> bool {
     }
 }
 
-/// Automation (control Messages.app). Probing it also surfaces the one-time
-/// consent dialog on first run — which is exactly what we want during setup.
+/// Automation (control Messages.app). Querying the services collection sends a
+/// real AppleEvent; reading the app name can succeed without exercising TCC.
 pub fn has_automation() -> bool {
     std::process::Command::new("osascript")
         .arg("-e")
-        .arg("tell application \"Messages\" to get name")
+        .arg("with timeout of 5 seconds")
+        .arg("-e")
+        .arg("tell application \"Messages\" to count services")
+        .arg("-e")
+        .arg("end timeout")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Permission state cached by the daemon. HTTP status handlers only read
+/// atomics; AppleScript and protected-file probes happen off the request path.
+#[derive(Clone, Default)]
+pub struct PermissionState {
+    full_disk_access: Arc<AtomicBool>,
+    automation: Arc<AtomicBool>,
+    checked: Arc<AtomicBool>,
+}
+
+impl PermissionState {
+    pub fn full_disk_access(&self) -> bool {
+        self.full_disk_access.load(Ordering::Relaxed)
+    }
+
+    pub fn automation(&self) -> bool {
+        self.automation.load(Ordering::Relaxed)
+    }
+
+    pub fn checked(&self) -> bool {
+        self.checked.load(Ordering::Acquire)
+    }
+
+    pub fn refresh(&self, chatdb: &Path) {
+        self.full_disk_access
+            .store(has_full_disk_access(chatdb), Ordering::Relaxed);
+        self.automation.store(has_automation(), Ordering::Relaxed);
+        self.checked.store(true, Ordering::Release);
+    }
+}
+
+pub fn spawn_refresh(state: PermissionState, chatdb: PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            let current = state.clone();
+            let path = chatdb.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || current.refresh(&path)).await {
+                tracing::warn!(%error, "permission refresh task failed");
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
 }
 
 fn open_pane(url: &str) {
@@ -47,6 +96,34 @@ fn full_disk_access_target() -> PathBuf {
     let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("blueski"));
     let resolved = executable.canonicalize().unwrap_or(executable);
     enclosing_app(&resolved).unwrap_or(&resolved).to_path_buf()
+}
+
+/// Relaunch setup through LaunchServices so TCC attributes protected-file
+/// access to the app bundle instead of the invoking terminal or agent.
+pub fn relaunch_setup_in_app() -> std::io::Result<bool> {
+    let target = full_disk_access_target();
+    if !target.extension().is_some_and(|ext| ext == "app") {
+        return Ok(false);
+    }
+
+    let status = std::process::Command::new("open")
+        .arg("-W")
+        .arg("-n")
+        .arg(&target)
+        .arg("--args")
+        .arg("setup")
+        .arg("--app-launched")
+        .status()?;
+
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "failed to launch {}",
+            target.display()
+        )));
+    }
+
+    println!("Completed permission setup in {}.", target.display());
+    Ok(true)
 }
 
 fn reveal_in_finder(path: &Path) {
@@ -97,9 +174,7 @@ pub fn run_setup(chatdb: &Path) {
             auto_done = true;
         }
         if fda_done && auto_done {
-            println!("\nAll set. Start Blueski with one supervisor:");
-            println!("  Homebrew: `brew services start blueski`");
-            println!("  Built-in: `blueski install`");
+            println!("\nmacOS authorization complete.");
             return;
         }
         std::thread::sleep(Duration::from_secs(2));

@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "blueski"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -343,6 +343,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tokio",
  "toml",
  "tower 0.5.3",
