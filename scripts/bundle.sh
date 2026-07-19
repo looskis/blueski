@@ -14,6 +14,7 @@ IDENTIFIER="com.looskis.blueski"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
 SIGN_ID="${SIGN_ID:--}"
 LOGO="${LOGO:-assets/blueski-icon.png}"
+ENTITLEMENTS="${ENTITLEMENTS:-assets/Blueski.entitlements}"
 
 APP="dist/${APP_DISPLAY}.app"
 CONTENTS="$APP/Contents"
@@ -61,7 +62,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force --options runtime --sign "$SIGN_ID" "$APP"
+codesign --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP"
 
 echo "built $APP (profile: $PROFILE, signed: $SIGN_ID)"
 echo "inner binary: $(pwd)/$CONTENTS/MacOS/$BIN_NAME"

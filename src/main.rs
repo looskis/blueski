@@ -19,7 +19,6 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use server::AppState;
 use std::io::Write;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,15 +61,28 @@ enum Command {
         #[arg(long)]
         follow: bool,
     },
-    /// Bring the daemon online (detached) and report status. Idempotent — if
-    /// already running, just reports status. This is the agent entrypoint.
+    /// Ask the OS supervisor to bring the daemon online and report status.
     Up,
-    /// Stop a daemon started with `up`.
+    /// Stop and unload the active OS-supervised daemon.
     Down,
-    /// Report health + live state + TCC permission state.
+    /// Report cached daemon, service, and permission state.
     Status,
+    /// Run expensive live permission and service diagnostics.
+    Doctor,
+    /// Publish through a supervised ngrok tunnel with bearer authentication.
+    Publish {
+        /// Reserved ngrok hostname (for example blueski.example.com).
+        #[arg(long)]
+        domain: String,
+    },
+    /// Stop and remove the public tunnel and its API bearer token.
+    Unpublish,
     /// Interactively grant macOS permissions (Full Disk Access, Automation).
-    Setup,
+    Setup {
+        /// Internal marker set when setup is relaunched through LaunchServices.
+        #[arg(long, hide = true)]
+        app_launched: bool,
+    },
     /// Install + load the LaunchAgent (persistent, starts at login).
     Install,
     /// Unload + remove the LaunchAgent.
@@ -97,10 +109,10 @@ fn main() -> Result<()> {
         Command::Up => up(),
         Command::Down => down(),
         Command::Status => status(),
-        Command::Setup => {
-            permissions::run_setup(&config::chatdb_path());
-            Ok(())
-        }
+        Command::Doctor => doctor(),
+        Command::Publish { domain } => publish(domain),
+        Command::Unpublish => unpublish(),
+        Command::Setup { app_launched } => setup(app_launched),
         Command::Install => launchd::install(),
         Command::Uninstall => launchd::uninstall(),
         Command::Run => run(),
@@ -117,7 +129,7 @@ fn events(since: i64, limit: Option<u64>, follow: bool) -> Result<()> {
             "http://127.0.0.1:{}/events/stream?since={since}",
             config.port
         );
-        stream_jsonl(&url)?;
+        stream_jsonl(&url, config.api_token.as_deref())?;
         return Ok(());
     }
 
@@ -125,7 +137,7 @@ fn events(since: i64, limit: Option<u64>, follow: bool) -> Result<()> {
     if let Some(limit) = limit {
         url.push_str(&format!("&limit={limit}"));
     }
-    let body = get_text(&url, None)?;
+    let body = get_text(&url, None, config.api_token.as_deref())?;
     let events: Vec<serde_json::Value> = serde_json::from_str(&body)?;
     for event in events {
         println!("{}", serde_json::to_string(&event)?);
@@ -161,20 +173,77 @@ fn send(
         "protocol": protocol,
         "client_ref": client_ref,
     });
-    let resp = post_json(&format!("http://127.0.0.1:{}/messages", config.port), body)?;
+    let resp = post_json(
+        &format!("http://127.0.0.1:{}/messages", config.port),
+        body,
+        config.api_token.as_deref(),
+    )?;
     print_status(&resp);
     Ok(())
+}
+
+/// One-command onboarding: install/repair launchd, start the daemon, complete
+/// the unavoidable TCC grants once, then print a machine-readable readiness
+/// document. The app-bundle hop gives macOS a stable authorization identity.
+fn setup(app_launched: bool) -> Result<()> {
+    if app_launched {
+        permissions::run_setup(&config::chatdb_path());
+        return Ok(());
+    }
+
+    let config = Config::load_or_init()?;
+    launchd::install()?;
+    ensure_running(&config)?;
+    if !permissions::relaunch_setup_in_app()? {
+        permissions::run_setup(&config::chatdb_path());
+    }
+
+    // The receive worker exits when chat.db is unreadable. Restart only after
+    // the TCC grants land so inbound monitoring starts with Full Disk Access.
+    launchd::start_supervised()?;
+
+    let status_url = format!("http://127.0.0.1:{}/status", config.port);
+    for _ in 0..20 {
+        if let Ok(body) = get_text(
+            &status_url,
+            Some(Duration::from_secs(2)),
+            config.api_token.as_deref(),
+        ) {
+            let value: serde_json::Value = serde_json::from_str(&body)?;
+            let ready = value["permissions"]["full_disk_access"] == true
+                && value["permissions"]["automation"] == true;
+            if ready {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "product": "blueski",
+                        "ready": true,
+                        "port": config.port,
+                        "supervisor": launchd::active_label()?,
+                        "permissions": value["permissions"],
+                    }))?
+                );
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    anyhow::bail!("macOS grants completed, but the daemon did not report readiness");
 }
 
 /// `up`: ensure the listener is online, then print status. Idempotent.
 fn up() -> Result<()> {
     let config = Config::load_or_init()?;
-    let url = format!("http://127.0.0.1:{}/status", config.port);
-    let was_up = probe(&url).is_some();
+    let was_up = probe(&config)?.is_some();
 
+    launchd::install()?;
     ensure_running(&config)?;
 
-    let body = probe(&url).unwrap_or_default();
+    let body = get_text(
+        &format!("http://127.0.0.1:{}/status", config.port),
+        Some(Duration::from_secs(2)),
+        config.api_token.as_deref(),
+    )?;
     println!(
         "blueski {} on 127.0.0.1:{}",
         if was_up { "already up" } else { "up" },
@@ -184,54 +253,121 @@ fn up() -> Result<()> {
     Ok(())
 }
 
-/// Ensure a daemon is listening: return immediately if `/status` answers, else
-/// spawn the `run` process detached and health-gate until it does (~10s).
+/// Ensure launchd owns a healthy daemon. The CLI never forks or daemonizes.
 fn ensure_running(config: &Config) -> Result<()> {
-    let url = format!("http://127.0.0.1:{}/status", config.port);
-    if probe(&url).is_some() {
+    if probe(config)?.is_some() {
         return Ok(());
     }
-    if probe_status(&url).is_some() {
-        anyhow::bail!(
-            "port {} is occupied by another service; change `port` in {}",
-            config.port,
-            config::config_path().display()
-        );
-    }
-
-    let exe = std::env::current_exe()?;
-    let out = open_log("/tmp/blueski.log")?;
-    let err = open_log("/tmp/blueski.err")?;
-    std::process::Command::new(exe)
-        .arg("run")
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err)
-        .spawn()?;
+    launchd::start_supervised()?;
 
     for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(250));
-        if probe(&url).is_some() {
+        if probe(config)?.is_some() {
             return Ok(());
         }
     }
-    anyhow::bail!("started, but control socket never became healthy — see /tmp/blueski.err");
+    anyhow::bail!(
+        "supervised daemon did not become healthy — see {}",
+        config::stderr_log_path().display()
+    );
 }
 
-/// `down`: stop a daemon previously started with `up` (via its pidfile).
+/// `down`: unload whichever launchd supervisor currently owns Blueski.
 fn down() -> Result<()> {
-    let pid_path = config::pid_path();
-    let Ok(pid) = std::fs::read_to_string(&pid_path).map(|s| s.trim().to_string()) else {
-        println!("no pidfile — daemon not running via `up`");
-        return Ok(());
-    };
-    let status = std::process::Command::new("kill").arg(&pid).status()?;
-    let _ = std::fs::remove_file(&pid_path);
-    if status.success() {
-        println!("stopped blueski (pid {pid})");
-    } else {
-        println!("no live process for pid {pid} (cleaned up pidfile)");
+    if launchd::stop_tunnel()? {
+        println!("stopped supervised Blueski tunnel");
     }
+    let stopped = launchd::stop_active()?;
+    if stopped.is_empty() {
+        println!("Blueski has no loaded supervisor");
+    } else {
+        for label in stopped {
+            println!("stopped supervised Blueski ({label})");
+        }
+    }
+    Ok(())
+}
+
+fn publish(domain: String) -> Result<()> {
+    let mut config = Config::load_or_init()?;
+    let token = config.api_token.clone().unwrap_or_else(|| {
+        format!(
+            "bs_{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    });
+    config.api_token = Some(token.clone());
+    config.save()?;
+
+    launchd::install()?;
+    launchd::start_supervised()?;
+    let mut authenticated = false;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(250));
+        if let Some(body) = probe(&config)? {
+            if serde_json::from_str::<serde_json::Value>(&body)?["authentication_required"] == true
+            {
+                authenticated = true;
+                break;
+            }
+        }
+    }
+    if !authenticated {
+        anyhow::bail!("daemon restarted, but did not enable API authentication");
+    }
+    launchd::install_tunnel(&domain, config.port)?;
+    let hostname = domain
+        .strip_prefix("https://")
+        .or_else(|| domain.strip_prefix("http://"))
+        .unwrap_or(&domain)
+        .trim_end_matches('/');
+    let public_url = format!("https://{hostname}");
+    let mut tunnel_ready = false;
+    for _ in 0..40 {
+        if let Ok(body) = get_text(
+            "http://127.0.0.1:4040/api/tunnels",
+            Some(Duration::from_millis(500)),
+            None,
+        ) {
+            let state: serde_json::Value = serde_json::from_str(&body)?;
+            tunnel_ready = state["tunnels"]
+                .as_array()
+                .is_some_and(|tunnels| tunnels.iter().any(|t| t["public_url"] == public_url));
+            if tunnel_ready {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if !tunnel_ready {
+        anyhow::bail!(
+            "ngrok did not publish {public_url}; see {}",
+            config::tunnel_stderr_log_path().display()
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "product": "blueski",
+            "published": true,
+            "url": public_url,
+            "authorization": format!("Bearer {token}"),
+            "supervisor": "com.looskis.blueski.ngrok",
+        }))?
+    );
+    Ok(())
+}
+
+fn unpublish() -> Result<()> {
+    let mut config = Config::load_or_init()?;
+    launchd::uninstall_tunnel()?;
+    config.api_token = None;
+    config.save()?;
+    if launchd::active_label()?.is_some() {
+        launchd::start_supervised()?;
+    }
+    println!(r#"{{"product":"blueski","published":false}}"#);
     Ok(())
 }
 
@@ -310,7 +446,10 @@ async fn async_run() -> Result<()> {
         config: config.clone(),
         store: store.clone(),
         events: event_tx,
+        permissions: permissions::PermissionState::default(),
     };
+
+    permissions::spawn_refresh(state.permissions.clone(), state.chatdb.clone());
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", config.port)).await?;
     tracing::info!(port = config.port, "control socket listening on loopback");
@@ -326,7 +465,7 @@ async fn async_run() -> Result<()> {
     Ok(())
 }
 
-fn get_text(url: &str, timeout: Option<Duration>) -> Result<String> {
+fn get_text(url: &str, timeout: Option<Duration>, token: Option<&str>) -> Result<String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -336,7 +475,11 @@ fn get_text(url: &str, timeout: Option<Duration>) -> Result<String> {
             builder = builder.timeout(timeout);
         }
         let client = builder.build()?;
-        let resp = client.get(url).send().await?;
+        let mut request = client.get(url);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let resp = request.send().await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
@@ -346,13 +489,17 @@ fn get_text(url: &str, timeout: Option<Duration>) -> Result<String> {
     })
 }
 
-fn stream_jsonl(url: &str) -> Result<()> {
+fn stream_jsonl(url: &str, token: Option<&str>) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(async {
         let client = reqwest::Client::builder().build()?;
-        let mut resp = client.get(url).send().await?;
+        let mut request = client.get(url);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let mut resp = request.send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -366,21 +513,35 @@ fn stream_jsonl(url: &str) -> Result<()> {
     })
 }
 
-/// `status`: local permission checks plus a live probe of the control socket.
+/// `status`: self-heal the supervised service, then read its cached state.
 fn status() -> Result<()> {
     let config = Config::load_or_init()?;
-    let chatdb = config::chatdb_path();
-    let url = format!("http://127.0.0.1:{}/status", config.port);
+    ensure_running(&config)?;
+    let body = get_text(
+        &format!("http://127.0.0.1:{}/status", config.port),
+        Some(Duration::from_secs(2)),
+        config.api_token.as_deref(),
+    )?;
+    print_status(&body);
+    Ok(())
+}
 
+/// Expensive diagnostics are deliberately separate from request-time status.
+fn doctor() -> Result<()> {
+    let config = Config::load_or_init()?;
+    ensure_running(&config)?;
     let report = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "transport": "applescript",
+        "product": "blueski",
+        "healthy": probe(&config)?.is_some(),
+        "supervisor": launchd::active_label()?,
         "port": config.port,
-        "running": probe(&url).is_some(),
-        "webhook_configured": config.webhook_url.is_some(),
         "config_path": config::config_path().display().to_string(),
+        "logs": {
+            "stdout": config::stdout_log_path().display().to_string(),
+            "stderr": config::stderr_log_path().display().to_string(),
+        },
         "permissions": {
-            "full_disk_access": permissions::has_full_disk_access(&chatdb),
+            "full_disk_access": permissions::has_full_disk_access(&config::chatdb_path()),
             "automation": permissions::has_automation(),
         }
     });
@@ -388,12 +549,31 @@ fn status() -> Result<()> {
     Ok(())
 }
 
-/// Blocking GET of the control socket's `/status`. Returns the body on 2xx.
-fn probe(url: &str) -> Option<String> {
-    probe_status(url).filter(|body| is_blueski_status(body))
+/// Fast identity probe. `/status` is used only for compatibility with a daemon
+/// from before `/healthz` existed during an in-place upgrade.
+fn probe(config: &Config) -> Result<Option<String>> {
+    let health_url = format!("http://127.0.0.1:{}/healthz", config.port);
+    match probe_url(&health_url, config.api_token.as_deref()) {
+        Some((200, body)) => {
+            if is_blueski_health(&body) {
+                return Ok(Some(body));
+            }
+            anyhow::bail!("port {} is occupied by another service", config.port);
+        }
+        Some((404, _)) => {}
+        Some(_) => return Ok(None),
+        None => return Ok(None),
+    }
+
+    let status_url = format!("http://127.0.0.1:{}/status", config.port);
+    match probe_url(&status_url, config.api_token.as_deref()) {
+        Some((200, body)) if is_blueski_status(&body) => Ok(Some(body)),
+        Some((200, _)) => anyhow::bail!("port {} is occupied by another service", config.port),
+        _ => Ok(None),
+    }
 }
 
-fn probe_status(url: &str) -> Option<String> {
+fn probe_url(url: &str, token: Option<&str>) -> Option<(u16, String)> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -403,30 +583,33 @@ fn probe_status(url: &str) -> Option<String> {
             .timeout(Duration::from_millis(800))
             .build()
             .ok()?;
-        let resp = client.get(url).send().await.ok()?;
-        if resp.status().is_success() {
-            resp.text().await.ok()
-        } else {
-            None
+        let mut request = client.get(url);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
         }
+        let resp = request.send().await.ok()?;
+        let status = resp.status().as_u16();
+        Some((status, resp.text().await.ok()?))
     })
 }
 
-fn is_blueski_status(body: &str) -> bool {
+fn is_blueski_health(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|status| {
-            status
-                .get("transport")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-        })
+        .and_then(|value| value.get("product")?.as_str().map(str::to_owned))
         .as_deref()
-        == Some("applescript")
+        == Some("blueski")
+}
+
+fn is_blueski_status(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|status| {
+        status.get("product").and_then(|value| value.as_str()) == Some("blueski")
+            || status.get("transport").and_then(|value| value.as_str()) == Some("applescript")
+    })
 }
 
 /// Blocking POST of a JSON body to the control socket; returns the response.
-fn post_json(url: &str, body: serde_json::Value) -> Result<String> {
+fn post_json(url: &str, body: serde_json::Value, token: Option<&str>) -> Result<String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -434,7 +617,11 @@ fn post_json(url: &str, body: serde_json::Value) -> Result<String> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
-        let resp = client.post(url).json(&body).send().await?;
+        let mut request = client.post(url).json(&body);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let resp = request.send().await?;
         let status = resp.status();
         Ok(resp.text().await?).and_then(|text| http_success_or_error("POST", url, status, text))
     })
@@ -461,13 +648,6 @@ fn print_status(body: &str) {
         ),
         Err(_) => println!("{body}"),
     }
-}
-
-fn open_log(path: &str) -> Result<std::fs::File> {
-    Ok(std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?)
 }
 
 #[cfg(test)]
@@ -509,5 +689,9 @@ mod tests {
             r#"{"status":"ok","transport":"applescript"}"#
         ));
         assert!(!is_blueski_status(r#"{"status":"ok","version":"0.1.0"}"#));
+        assert!(is_blueski_health(r#"{"status":"ok","product":"blueski"}"#));
+        assert!(!is_blueski_health(
+            r#"{"status":"ok","product":"greenski"}"#
+        ));
     }
 }

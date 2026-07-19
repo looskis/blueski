@@ -7,10 +7,11 @@ use crate::permissions;
 use crate::store::{self, JournaledEvent, Store};
 use axum::{
     body::Body,
-    extract::{Query, State},
-    http::{header, StatusCode},
+    extract::{Path, Query, Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use bytes::Bytes;
@@ -20,6 +21,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone)]
@@ -30,6 +32,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub store: Store,
     pub events: broadcast::Sender<JournaledEvent>,
+    pub permissions: permissions::PermissionState,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,13 +43,87 @@ struct EventsQuery {
 }
 
 pub fn router(state: AppState) -> Router {
+    let auth_config = state.config.clone();
     Router::new()
-        .route("/messages", post(post_messages))
+        .route("/messages", get(get_messages).post(post_messages))
+        .route("/messages/:id", get(get_message))
         .route("/events", get(get_events))
         .route("/events/stream", get(stream_events))
+        .route("/healthz", get(get_health))
         .route("/status", get(get_status))
         .route("/debug/chatdb", get(get_debug_chatdb))
+        .layer(middleware::from_fn_with_state(auth_config, require_auth))
         .with_state(state)
+}
+
+async fn require_auth(State(config): State<Arc<Config>>, request: Request, next: Next) -> Response {
+    let Some(token) = config.api_token.as_deref() else {
+        return next.run(request).await;
+    };
+    if bearer_matches(request.headers().get(header::AUTHORIZATION), token) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid bearer token" })),
+        )
+            .into_response()
+    }
+}
+
+fn bearer_matches(header: Option<&HeaderValue>, expected: &str) -> bool {
+    let Some(provided) = header
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
+}
+
+async fn get_health(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "status": "ok",
+        "product": "blueski",
+        "version": env!("CARGO_PKG_VERSION"),
+        "port": state.config.port,
+        "authentication_required": state.config.api_token.is_some(),
+    }))
+}
+
+async fn get_messages(State(state): State<AppState>, Query(q): Query<EventsQuery>) -> Response {
+    let conn = match state.store.conn() {
+        Ok(conn) => conn,
+        Err(error) => return internal_error(error),
+    };
+    match store::list_messages(&conn, q.since, q.limit).await {
+        Ok(messages) => Json(messages).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn get_message(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let conn = match state.store.conn() {
+        Ok(conn) => conn,
+        Err(error) => return internal_error(error),
+    };
+    match store::get_message_events(&conn, &id).await {
+        Ok(events) if events.is_empty() => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "message not found" })),
+        )
+            .into_response(),
+        Ok(events) => Json(json!({ "message_id": id, "events": events })).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+fn internal_error(error: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": error.to_string() })),
+    )
+        .into_response()
 }
 
 async fn get_debug_chatdb(State(state): State<AppState>) -> impl IntoResponse {
@@ -189,14 +266,16 @@ async fn stream_events(State(state): State<AppState>, Query(q): Query<EventsQuer
 async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "status": "ok",
+        "product": "blueski",
         "version": env!("CARGO_PKG_VERSION"),
         "transport": "applescript",
         "uptime_secs": state.start.elapsed().as_secs(),
         "port": state.config.port,
         "webhook_configured": state.config.webhook_url.is_some(),
         "permissions": {
-            "full_disk_access": permissions::has_full_disk_access(&state.chatdb),
-            "automation": permissions::has_automation(),
+            "checked": state.permissions.checked(),
+            "full_disk_access": state.permissions.full_disk_access(),
+            "automation": state.permissions.automation(),
         }
     }))
 }
@@ -226,6 +305,7 @@ mod tests {
             config: Arc::new(Config::default()),
             store,
             events,
+            permissions: permissions::PermissionState::default(),
         }
     }
 
@@ -301,6 +381,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_collection_and_detail_are_public_routes() {
+        let store = Store::open(&temp_db_path("message-routes")).await.unwrap();
+        let conn = store.conn().unwrap();
+        let event = Event::new("message.sent", "message-1".to_string());
+        store::record_event(&conn, &event).await.unwrap();
+        let app = router(test_state(store).await);
+
+        let collection = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/messages?since=0&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(collection.status(), StatusCode::OK);
+
+        let detail = app
+            .oneshot(
+                Request::builder()
+                    .uri("/messages/message-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn status_reports_applescript_as_the_only_transport() {
         let store = Store::open(&temp_db_path("status-transport"))
             .await
@@ -320,5 +432,75 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(status["transport"], "applescript");
+        assert_eq!(status["product"], "blueski");
+    }
+
+    #[tokio::test]
+    async fn health_is_fast_and_side_effect_free() {
+        let store = Store::open(&temp_db_path("health-route")).await.unwrap();
+        let app = router(test_state(store).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["product"], "blueski");
+        assert!(health.get("permissions").is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_bearer_token_protects_every_route() {
+        let store = Store::open(&temp_db_path("auth-route")).await.unwrap();
+        let mut state = test_state(store).await;
+        let config = Config {
+            api_token: Some("test-secret".to_string()),
+            ..Config::default()
+        };
+        state.config = Arc::new(config);
+        let app = router(state);
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("authorization", "Bearer test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn bearer_auth_requires_an_exact_token() {
+        let valid = HeaderValue::from_static("Bearer test-secret");
+        let wrong = HeaderValue::from_static("Bearer test-secreu");
+        let wrong_scheme = HeaderValue::from_static("Basic test-secret");
+
+        assert!(bearer_matches(Some(&valid), "test-secret"));
+        assert!(!bearer_matches(Some(&wrong), "test-secret"));
+        assert!(!bearer_matches(Some(&wrong_scheme), "test-secret"));
+        assert!(!bearer_matches(None, "test-secret"));
     }
 }

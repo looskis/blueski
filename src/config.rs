@@ -27,6 +27,22 @@ pub fn pid_path() -> PathBuf {
     config_dir().join("daemon.pid")
 }
 
+pub fn stdout_log_path() -> PathBuf {
+    config_dir().join("blueski.log")
+}
+
+pub fn stderr_log_path() -> PathBuf {
+    config_dir().join("blueski.err.log")
+}
+
+pub fn tunnel_stdout_log_path() -> PathBuf {
+    config_dir().join("ngrok.log")
+}
+
+pub fn tunnel_stderr_log_path() -> PathBuf {
+    config_dir().join("ngrok.err.log")
+}
+
 /// Correlation store (libSQL/Turso) — message_id <-> chat.db guid bindings.
 pub fn store_path() -> PathBuf {
     config_dir().join("state.db")
@@ -44,6 +60,10 @@ pub fn plist_path() -> PathBuf {
     home().join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 
+pub fn tunnel_plist_path() -> PathBuf {
+    home().join(format!("Library/LaunchAgents/{LABEL}.ngrok.plist"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Loopback port for the control socket.
@@ -52,6 +72,9 @@ pub struct Config {
     pub webhook_url: Option<String>,
     /// Shared secret used to sign webhook payloads (HMAC-SHA256).
     pub hmac_secret: String,
+    /// Bearer token required by the HTTP API when public publishing is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<String>,
 }
 
 impl Default for Config {
@@ -60,6 +83,7 @@ impl Default for Config {
             port: 8788,
             webhook_url: None,
             hmac_secret: uuid::Uuid::new_v4().to_string(),
+            api_token: None,
         }
     }
 }
@@ -71,15 +95,34 @@ impl Config {
         if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            Ok(toml::from_str(&raw)?)
+            let config = toml::from_str(&raw)?;
+            secure_config_file(&path)?;
+            Ok(config)
         } else {
             let cfg = Config::default();
             std::fs::create_dir_all(config_dir())?;
-            std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
+            cfg.save()?;
             tracing::info!(path = %path.display(), "wrote default config");
             Ok(cfg)
         }
     }
+
+    pub fn save(&self) -> Result<()> {
+        let path = config_path();
+        std::fs::create_dir_all(config_dir())?;
+        std::fs::write(&path, toml::to_string_pretty(self)?)?;
+        secure_config_file(&path)?;
+        Ok(())
+    }
+}
+
+fn secure_config_file(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

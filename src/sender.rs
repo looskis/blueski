@@ -4,6 +4,9 @@ use crate::model::{SendJob, SendTarget};
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
+
+const APPLESCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub trait Sender {
     /// Deliver `job`. `Ok` means Messages.app accepted the AppleScript send.
@@ -60,6 +63,7 @@ end run"#
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawn osascript: {e}"))?;
 
@@ -71,9 +75,14 @@ end run"#
                 .map_err(|e| format!("write script: {e}"))?;
         }
 
-        let out = child
-            .wait_with_output()
+        let out = timeout(APPLESCRIPT_TIMEOUT, child.wait_with_output())
             .await
+            .map_err(|_| {
+                format!(
+                    "AppleScript timed out after {} seconds",
+                    APPLESCRIPT_TIMEOUT.as_secs()
+                )
+            })?
             .map_err(|e| format!("wait osascript: {e}"))?;
 
         if out.status.success() {

@@ -186,6 +186,65 @@ pub async fn list_events_since(
     Ok(events)
 }
 
+/// Return the latest journal entry for each message. This gives agents a
+/// compact message collection while `GET /messages/:id` retains the complete
+/// lifecycle for a single message.
+pub async fn list_messages(
+    conn: &Connection,
+    since: i64,
+    limit: Option<u64>,
+) -> Result<Vec<JournaledEvent>> {
+    let limit = limit.unwrap_or(100).min(1_000) as i64;
+    let mut rows = conn
+        .query(
+            "SELECT e.id, e.event, e.message_id, e.client_ref, e.handle, e.text,
+                    e.protocol, e.status, e.reason, e.timestamp, e.created_at
+             FROM events e
+             JOIN (SELECT message_id, MAX(id) AS id FROM events GROUP BY message_id) latest
+               ON latest.id = e.id
+             WHERE e.id > ?1
+             ORDER BY e.id ASC LIMIT ?2",
+            params![since, limit],
+        )
+        .await?;
+    read_journaled_events(&mut rows).await
+}
+
+pub async fn get_message_events(
+    conn: &Connection,
+    message_id: &str,
+) -> Result<Vec<JournaledEvent>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, event, message_id, client_ref, handle, text, protocol,
+                    status, reason, timestamp, created_at
+             FROM events WHERE message_id = ?1 ORDER BY id ASC",
+            params![message_id],
+        )
+        .await?;
+    read_journaled_events(&mut rows).await
+}
+
+async fn read_journaled_events(rows: &mut libsql::Rows) -> Result<Vec<JournaledEvent>> {
+    let mut events = Vec::new();
+    while let Some(row) = rows.next().await? {
+        events.push(JournaledEvent {
+            id: row.get(0)?,
+            event: row.get(1)?,
+            message_id: row.get(2)?,
+            client_ref: row.get(3)?,
+            handle: row.get(4)?,
+            text: row.get(5)?,
+            protocol: row.get(6)?,
+            status: row.get(7)?,
+            reason: row.get(8)?,
+            timestamp: row.get(9)?,
+            created_at: row.get(10)?,
+        });
+    }
+    Ok(events)
+}
+
 async fn last_insert_rowid(conn: &Connection) -> Result<i64> {
     let mut rows = conn.query("SELECT last_insert_rowid()", ()).await?;
     let Some(row) = rows.next().await? else {
