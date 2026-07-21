@@ -117,12 +117,16 @@ Use exactly one of `to` or `chat_id`. `chat_id` is the stable `chat.guid`
 returned on events and works for direct and group conversations. A successful
 queue operation returns `202 Accepted` with a generated `message_id` only after
 the complete job and its `message.queued` event have committed to `state.db`.
+The response includes `"idempotent": true` when `client_ref` was supplied and
+`false` when the request is intentionally non-idempotent.
 
 `client_ref` is an installation-scoped idempotency key when it is non-null.
 Repeating a request with the same value returns the original `message_id` and
-does not dispatch another message. Existing installations may have reused
-`client_ref` as a correlation-only value; migration keeps one existing binding
-for each such value without modifying historical event rows.
+does not dispatch another message only when the target kind, target value,
+protocol, and text are also identical. Reusing the key with any of those fields
+changed returns `409 Conflict`. Existing correlation-only `client_ref` values
+do not enter this namespace: the first request accepted after upgrading to
+0.2.0 establishes the fingerprinted binding for that value.
 
 Other endpoints:
 
@@ -134,12 +138,16 @@ Other endpoints:
 - `GET /events/stream?since=<cursor>` — newline-delimited live event stream
 
 Events include `message.queued`, `message.sent`, `message.failed`,
-`message.received`, and `message.status`. If `webhook_url` is configured, the
-same events are POSTed with an `X-Blueski-Signature` HMAC-SHA256 header.
+`message.received`, and `message.status`. Each configured `[[webhooks]]`
+destination receives the same events with an `X-Blueski-Signature` HMAC-SHA256
+header. The legacy `webhook_url` and `hmac_secret` fields continue to load as
+one destination named `legacy`.
 
 Every webhook body is the same journaled envelope returned by `GET /events`,
-including its local cursor `id`, `created_at`, optional `chat_id`, and optional
-`provider_message_id`. The signature covers those exact raw JSON bytes.
+including `installation_id`, its local cursor `id`, `created_at`, optional
+`chat_id`, and optional `provider_message_id`. The signature covers those exact
+raw JSON bytes. Each enabled destination has a bounded ordered worker, its own
+retry loop, and a distinct secret, so a slow endpoint does not delay another.
 
 Lifecycle semantics:
 
@@ -154,20 +162,38 @@ Lifecycle semantics:
 Inbound events are journaled at least once before the Messages receive
 watermark advances. Journal entries are replayable by cursor. Webhook delivery
 is best effort; consumers recover gaps through `/events?since=<cursor>` and
-deduplicate deliveries by `(installation, event.id)`. If a crash causes the
+deduplicate deliveries by `(installation_id, event.id)`. If a crash causes the
 same inbound provider message to be journaled again, deduplicate its semantic
-processing by `(installation, provider_message_id, event kind/status)`.
+processing by `(installation_id, provider_message_id, event kind/status)`.
 
 ## Configuration and state
 
 The first command creates `~/.config/blueski/config.toml`:
 
 ```toml
+installation_id = "bsinst_0123456789abcdef0123456789abcdef"
 port = 8788
-webhook_url = "https://example.com/blueski/events" # optional
-hmac_secret = "replace-me"
 api_token = "bs_..." # generated only by `blueski publish`
+
+[[webhooks]]
+id = "looski-local"
+url = "http://127.0.0.1:3001/webhooks/blueski"
+secret = "generate-a-unique-secret"
+enabled = true
+
+[[webhooks]]
+id = "audit-service"
+url = "https://events.example.com/blueski"
+secret = "generate-a-different-secret"
+enabled = true
 ```
+
+Webhook IDs and secrets must be nonempty, IDs and secrets must be unique, and
+at most 16 destinations may be configured. Plain HTTP is accepted only for
+loopback destinations; remote destinations require HTTPS. Configuring both
+legacy `webhook_url` and `[[webhooks]]` is an error. `/status` reports only each
+destination's ID, enabled state, last success time, and safe error category; it
+never returns webhook URLs, secrets, or signatures.
 
 State lives in the same directory:
 

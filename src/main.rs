@@ -45,7 +45,7 @@ enum Command {
         /// Messaging protocol: imessage | sms (more to come).
         #[arg(long, default_value = "imessage")]
         protocol: String,
-        /// Correlation id echoed back in webhooks.
+        /// Installation-scoped idempotency key echoed back in events.
         #[arg(long)]
         client_ref: Option<String>,
         /// Positional fallback: <TO> <TEXT> (used if --to/--text are omitted).
@@ -417,7 +417,11 @@ async fn async_run() -> Result<()> {
     let _ = std::fs::write(config::pid_path(), std::process::id().to_string());
 
     // Correlation store (Turso/libSQL) binding our message_id <-> chat.db guid.
-    let store = store::Store::open(&config::store_path().to_string_lossy()).await?;
+    let store = store::Store::open(
+        &config::store_path().to_string_lossy(),
+        &config.installation_id,
+    )
+    .await?;
     let active_provider_guids = match store::active_provider_guids(&store.conn()?).await {
         Ok(guids) => guids,
         Err(error) => {
@@ -432,8 +436,7 @@ async fn async_run() -> Result<()> {
         .build()?;
     let sink = webhook::spawn(
         client,
-        config.webhook_url.clone(),
-        config.hmac_secret.clone(),
+        config.effective_webhooks()?,
         store.clone(),
         event_tx.clone(),
     );

@@ -459,7 +459,9 @@ mod tests {
             .join(format!("blueski-receive-query-{}.db", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        let _store = crate::store::Store::open(&state_path).await.unwrap();
+        let _store = crate::store::Store::open(&state_path, "bsinst_test")
+            .await
+            .unwrap();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE message (

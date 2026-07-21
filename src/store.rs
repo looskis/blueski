@@ -15,6 +15,8 @@ use crate::webhook::EventSink;
 use anyhow::Result;
 use libsql::{params, Builder, Connection, Database};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
@@ -39,7 +41,25 @@ pub struct AcceptedSend {
     pub status: String,
     pub is_new: bool,
     pub journaled: Option<JournaledEvent>,
+    pub idempotent: bool,
 }
+
+#[derive(Debug)]
+pub struct IdempotencyConflict {
+    pub client_ref: String,
+}
+
+impl fmt::Display for IdempotencyConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "client_ref {} was already used for a different request",
+            self.client_ref
+        )
+    }
+}
+
+impl std::error::Error for IdempotencyConflict {}
 
 #[derive(Debug, Clone)]
 pub struct DurableSend {
@@ -51,6 +71,7 @@ pub struct DurableSend {
 /// A persisted event with its local durable cursor.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JournaledEvent {
+    pub installation_id: String,
     pub id: i64,
     pub event: String,
     pub message_id: String,
@@ -81,7 +102,7 @@ pub struct Store {
 
 impl Store {
     /// Open (creating if needed) the local libSQL db and run migrations.
-    pub async fn open(path: &str) -> Result<Store> {
+    pub async fn open(path: &str, installation_id: &str) -> Result<Store> {
         let db = Builder::new_local(path).build().await?;
         let conn = db.connect()?;
         conn.execute_batch(
@@ -106,6 +127,7 @@ impl Store {
                  ON outbound(handle, guid, pre_rowid);
              CREATE TABLE IF NOT EXISTS events (
                  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                 installation_id TEXT,
                  event        TEXT NOT NULL,
                  message_id   TEXT NOT NULL,
                  provider_message_id TEXT,
@@ -136,16 +158,52 @@ impl Store {
         .await?;
         ensure_column(&conn, "events", "provider_message_id", "TEXT").await?;
         ensure_column(&conn, "events", "chat_id", "TEXT").await?;
+        ensure_column(&conn, "events", "installation_id", "TEXT").await?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS outbound_idempotency (
                  client_ref TEXT PRIMARY KEY,
-                 message_id TEXT NOT NULL UNIQUE
+                 message_id TEXT NOT NULL UNIQUE,
+                 request_fingerprint TEXT
              );
              INSERT OR IGNORE INTO outbound_idempotency (client_ref, message_id)
              SELECT client_ref, MIN(message_id)
              FROM outbound
              WHERE client_ref IS NOT NULL
              GROUP BY client_ref;",
+        )
+        .await?;
+        ensure_column(&conn, "outbound_idempotency", "request_fingerprint", "TEXT").await?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS metadata (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );",
+        )
+        .await?;
+        let mut rows = conn
+            .query(
+                "SELECT value FROM metadata WHERE key = 'installation_id'",
+                (),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let stored: String = row.get(0)?;
+            if stored != installation_id {
+                anyhow::bail!(
+                    "state database installation_id {stored} does not match config {installation_id}"
+                );
+            }
+        } else {
+            drop(rows);
+            conn.execute(
+                "INSERT INTO metadata (key, value) VALUES ('installation_id', ?1)",
+                params![installation_id],
+            )
+            .await?;
+        }
+        conn.execute(
+            "UPDATE events SET installation_id = ?1 WHERE installation_id IS NULL",
+            params![installation_id],
         )
         .await?;
         Ok(Store { db: Arc::new(db) })
@@ -182,14 +240,16 @@ async fn ensure_column(
 
 /// Persist an emitted event and return the journaled shape consumers read.
 pub async fn record_event(conn: &Connection, event: &Event) -> Result<JournaledEvent> {
+    let installation_id = installation_id(conn).await?;
     let payload_json = serde_json::to_string(event)?;
     let created_at = now_iso();
     conn.execute(
         "INSERT INTO events
-           (event, message_id, provider_message_id, client_ref, handle, chat_id,
+           (installation_id, event, message_id, provider_message_id, client_ref, handle, chat_id,
             text, protocol, status, reason, timestamp, payload_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
+            installation_id.clone(),
             event.event.clone(),
             event.message_id.clone(),
             event.provider_message_id.clone(),
@@ -209,6 +269,7 @@ pub async fn record_event(conn: &Connection, event: &Event) -> Result<JournaledE
 
     let id = last_insert_rowid(conn).await?;
     Ok(JournaledEvent {
+        installation_id,
         id,
         event: event.event.clone(),
         message_id: event.message_id.clone(),
@@ -233,12 +294,12 @@ pub async fn list_events_since(
 ) -> Result<Vec<JournaledEvent>> {
     let sql = match limit {
         Some(_) => {
-            "SELECT id, event, message_id, provider_message_id, client_ref, handle,
+            "SELECT installation_id, id, event, message_id, provider_message_id, client_ref, handle,
                     chat_id, text, protocol, status, reason, timestamp, created_at
              FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2"
         }
         None => {
-            "SELECT id, event, message_id, provider_message_id, client_ref, handle,
+            "SELECT installation_id, id, event, message_id, provider_message_id, client_ref, handle,
                     chat_id, text, protocol, status, reason, timestamp, created_at
              FROM events WHERE id > ?1 ORDER BY id ASC"
         }
@@ -251,19 +312,20 @@ pub async fn list_events_since(
     let mut events = Vec::new();
     while let Some(row) = rows.next().await? {
         events.push(JournaledEvent {
-            id: row.get(0)?,
-            event: row.get(1)?,
-            message_id: row.get(2)?,
-            provider_message_id: row.get(3)?,
-            client_ref: row.get(4)?,
-            handle: row.get(5)?,
-            chat_id: row.get(6)?,
-            text: row.get(7)?,
-            protocol: row.get(8)?,
-            status: row.get(9)?,
-            reason: row.get(10)?,
-            timestamp: row.get(11)?,
-            created_at: row.get(12)?,
+            installation_id: row.get(0)?,
+            id: row.get(1)?,
+            event: row.get(2)?,
+            message_id: row.get(3)?,
+            provider_message_id: row.get(4)?,
+            client_ref: row.get(5)?,
+            handle: row.get(6)?,
+            chat_id: row.get(7)?,
+            text: row.get(8)?,
+            protocol: row.get(9)?,
+            status: row.get(10)?,
+            reason: row.get(11)?,
+            timestamp: row.get(12)?,
+            created_at: row.get(13)?,
         });
     }
     Ok(events)
@@ -280,7 +342,7 @@ pub async fn list_messages(
     let limit = limit.unwrap_or(100).min(1_000) as i64;
     let mut rows = conn
         .query(
-            "SELECT e.id, e.event, e.message_id, e.provider_message_id, e.client_ref,
+            "SELECT e.installation_id, e.id, e.event, e.message_id, e.provider_message_id, e.client_ref,
                     e.handle, e.chat_id, e.text, e.protocol, e.status, e.reason,
                     e.timestamp, e.created_at
              FROM events e
@@ -300,7 +362,7 @@ pub async fn get_message_events(
 ) -> Result<Vec<JournaledEvent>> {
     let mut rows = conn
         .query(
-            "SELECT id, event, message_id, provider_message_id, client_ref, handle,
+            "SELECT installation_id, id, event, message_id, provider_message_id, client_ref, handle,
                     chat_id, text, protocol, status, reason, timestamp, created_at
              FROM events WHERE message_id = ?1 ORDER BY id ASC",
             params![message_id],
@@ -313,22 +375,36 @@ async fn read_journaled_events(rows: &mut libsql::Rows) -> Result<Vec<JournaledE
     let mut events = Vec::new();
     while let Some(row) = rows.next().await? {
         events.push(JournaledEvent {
-            id: row.get(0)?,
-            event: row.get(1)?,
-            message_id: row.get(2)?,
-            provider_message_id: row.get(3)?,
-            client_ref: row.get(4)?,
-            handle: row.get(5)?,
-            chat_id: row.get(6)?,
-            text: row.get(7)?,
-            protocol: row.get(8)?,
-            status: row.get(9)?,
-            reason: row.get(10)?,
-            timestamp: row.get(11)?,
-            created_at: row.get(12)?,
+            installation_id: row.get(0)?,
+            id: row.get(1)?,
+            event: row.get(2)?,
+            message_id: row.get(3)?,
+            provider_message_id: row.get(4)?,
+            client_ref: row.get(5)?,
+            handle: row.get(6)?,
+            chat_id: row.get(7)?,
+            text: row.get(8)?,
+            protocol: row.get(9)?,
+            status: row.get(10)?,
+            reason: row.get(11)?,
+            timestamp: row.get(12)?,
+            created_at: row.get(13)?,
         });
     }
     Ok(events)
+}
+
+async fn installation_id(conn: &Connection) -> Result<String> {
+    let mut rows = conn
+        .query(
+            "SELECT value FROM metadata WHERE key = 'installation_id'",
+            (),
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        anyhow::bail!("installation_id metadata is missing");
+    };
+    Ok(row.get(0)?)
 }
 
 async fn last_insert_rowid(conn: &Connection) -> Result<i64> {
@@ -346,35 +422,63 @@ pub async fn accept_and_record_queued(conn: &Connection, job: &SendJob) -> Resul
     let tx = conn.transaction().await?;
 
     if let Some(client_ref) = job.client_ref.as_deref() {
-        tx.execute(
-            "INSERT OR IGNORE INTO outbound_idempotency (client_ref, message_id)
-             VALUES (?1, ?2)",
-            params![client_ref, job.message_id.clone()],
-        )
-        .await?;
+        let fingerprint = request_fingerprint(job);
         let mut rows = tx
             .query(
-                "SELECT i.message_id, COALESCE(o.last_status, 'queued')
+                "SELECT i.message_id, i.request_fingerprint,
+                        COALESCE(o.last_status, 'queued')
                  FROM outbound_idempotency i
                  LEFT JOIN outbound o ON o.message_id = i.message_id
                  WHERE i.client_ref = ?1",
                 params![client_ref],
             )
             .await?;
-        let Some(row) = rows.next().await? else {
-            anyhow::bail!("idempotency mapping disappeared during acceptance");
+        let existing = match rows.next().await? {
+            Some(row) => Some((
+                row.get::<String>(0)?,
+                row.get::<Option<String>>(1)?,
+                row.get::<String>(2)?,
+            )),
+            None => None,
         };
-        let existing_id: String = row.get(0)?;
-        let existing_status: String = row.get(1)?;
         drop(rows);
-        if existing_id != job.message_id {
-            tx.commit().await?;
-            return Ok(AcceptedSend {
-                message_id: existing_id,
-                status: existing_status,
-                is_new: false,
-                journaled: None,
-            });
+        match existing {
+            Some((existing_id, Some(existing_fingerprint), existing_status)) => {
+                if existing_fingerprint != fingerprint {
+                    return Err(IdempotencyConflict {
+                        client_ref: client_ref.to_string(),
+                    }
+                    .into());
+                }
+                tx.commit().await?;
+                return Ok(AcceptedSend {
+                    message_id: existing_id,
+                    status: existing_status,
+                    is_new: false,
+                    journaled: None,
+                    idempotent: true,
+                });
+            }
+            // A null fingerprint is a pre-upgrade correlation binding. The
+            // first request after this upgrade starts the idempotency namespace.
+            Some((_, None, _)) => {
+                tx.execute(
+                    "UPDATE outbound_idempotency
+                     SET message_id = ?1, request_fingerprint = ?2
+                     WHERE client_ref = ?3 AND request_fingerprint IS NULL",
+                    params![job.message_id.clone(), fingerprint, client_ref],
+                )
+                .await?;
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO outbound_idempotency
+                       (client_ref, message_id, request_fingerprint)
+                     VALUES (?1, ?2, ?3)",
+                    params![client_ref, job.message_id.clone(), fingerprint],
+                )
+                .await?;
+            }
         }
     }
 
@@ -404,7 +508,22 @@ pub async fn accept_and_record_queued(conn: &Connection, job: &SendJob) -> Resul
         status: "queued".to_string(),
         is_new: true,
         journaled: Some(journaled),
+        idempotent: job.client_ref.is_some(),
     })
+}
+
+fn request_fingerprint(job: &SendJob) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        job.target.kind().as_bytes(),
+        job.target.store_key().as_bytes(),
+        job.protocol.as_bytes(),
+        job.text.as_bytes(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    hex::encode(hasher.finalize())
 }
 
 pub async fn next_queued(conn: &Connection) -> Result<Option<DurableSend>> {
@@ -673,14 +792,16 @@ fn status_event(binding: &Binding, status: &str, timestamp: String) -> Event {
 }
 
 async fn insert_event_tx(tx: &libsql::Transaction, event: &Event) -> Result<JournaledEvent> {
+    let installation_id = installation_id_tx(tx).await?;
     let payload_json = serde_json::to_string(event)?;
     let created_at = now_iso();
     tx.execute(
         "INSERT INTO events
-           (event, message_id, provider_message_id, client_ref, handle, chat_id,
+           (installation_id, event, message_id, provider_message_id, client_ref, handle, chat_id,
             text, protocol, status, reason, timestamp, payload_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
+            installation_id.clone(),
             event.event.clone(),
             event.message_id.clone(),
             event.provider_message_id.clone(),
@@ -697,11 +818,35 @@ async fn insert_event_tx(tx: &libsql::Transaction, event: &Event) -> Result<Jour
         ],
     )
     .await?;
-    Ok(journaled_event(tx.last_insert_rowid(), event, created_at))
+    Ok(journaled_event(
+        installation_id,
+        tx.last_insert_rowid(),
+        event,
+        created_at,
+    ))
 }
 
-fn journaled_event(id: i64, event: &Event, created_at: String) -> JournaledEvent {
+async fn installation_id_tx(tx: &libsql::Transaction) -> Result<String> {
+    let mut rows = tx
+        .query(
+            "SELECT value FROM metadata WHERE key = 'installation_id'",
+            (),
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        anyhow::bail!("installation_id metadata is missing");
+    };
+    Ok(row.get(0)?)
+}
+
+fn journaled_event(
+    installation_id: String,
+    id: i64,
+    event: &Event,
+    created_at: String,
+) -> JournaledEvent {
     JournaledEvent {
+        installation_id,
         id,
         event: event.event.clone(),
         message_id: event.message_id.clone(),
@@ -843,7 +988,7 @@ mod tests {
     #[tokio::test]
     async fn records_and_lists_events_by_cursor() {
         let path = temp_db_path("events-cursor");
-        let store = Store::open(&path).await.unwrap();
+        let store = Store::open(&path, "bsinst_test").await.unwrap();
         let conn = store.conn().unwrap();
 
         let first = record_event(&conn, &event("m1", "one")).await.unwrap();
@@ -860,7 +1005,7 @@ mod tests {
     #[tokio::test]
     async fn applies_limit_in_ascending_order() {
         let path = temp_db_path("events-limit");
-        let store = Store::open(&path).await.unwrap();
+        let store = Store::open(&path, "bsinst_test").await.unwrap();
         let conn = store.conn().unwrap();
 
         let first = record_event(&conn, &event("m1", "one")).await.unwrap();
@@ -876,7 +1021,7 @@ mod tests {
     #[tokio::test]
     async fn acceptance_is_durable_and_idempotent_by_client_ref() {
         let path = temp_db_path("durable-acceptance");
-        let store = Store::open(&path).await.unwrap();
+        let store = Store::open(&path, "bsinst_test").await.unwrap();
         let conn = store.conn().unwrap();
         let first_job = send_job(
             "local-1",
@@ -897,8 +1042,10 @@ mod tests {
         let replay = accept_and_record_queued(&conn, &replay_job).await.unwrap();
 
         assert!(first.is_new);
+        assert!(first.idempotent);
         assert_eq!(first.message_id, "local-1");
         assert!(!replay.is_new);
+        assert!(replay.idempotent);
         assert_eq!(replay.message_id, "local-1");
         let queued = next_queued(&conn).await.unwrap().unwrap();
         assert_eq!(queued.job, first_job);
@@ -906,12 +1053,67 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, "message.queued");
         assert_eq!(events[0].status.as_deref(), Some("queued"));
+        assert_eq!(events[0].installation_id, "bsinst_test");
+    }
+
+    #[tokio::test]
+    async fn reused_client_ref_with_a_different_fingerprint_conflicts() {
+        let path = temp_db_path("idempotency-conflict");
+        let store = Store::open(&path, "bsinst_test").await.unwrap();
+        let conn = store.conn().unwrap();
+        let first = send_job(
+            "local-1",
+            Some("caller-key"),
+            SendTarget::Handle {
+                to: "+15550000001".to_string(),
+            },
+        );
+        let mut changed = send_job(
+            "local-2",
+            Some("caller-key"),
+            SendTarget::Handle {
+                to: "+15550000001".to_string(),
+            },
+        );
+        changed.text = "different body".to_string();
+
+        accept_and_record_queued(&conn, &first).await.unwrap();
+        let error = accept_and_record_queued(&conn, &changed).await.unwrap_err();
+        assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
+        assert_eq!(list_events_since(&conn, 0, None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_client_ref_is_explicitly_non_idempotent() {
+        let path = temp_db_path("non-idempotent");
+        let store = Store::open(&path, "bsinst_test").await.unwrap();
+        let conn = store.conn().unwrap();
+        let first = send_job(
+            "local-1",
+            None,
+            SendTarget::Handle {
+                to: "+15550000001".to_string(),
+            },
+        );
+        let second = send_job(
+            "local-2",
+            None,
+            SendTarget::Handle {
+                to: "+15550000001".to_string(),
+            },
+        );
+
+        let first = accept_and_record_queued(&conn, &first).await.unwrap();
+        let second = accept_and_record_queued(&conn, &second).await.unwrap();
+        assert!(!first.idempotent);
+        assert!(!second.idempotent);
+        assert_ne!(first.message_id, second.message_id);
     }
 
     #[tokio::test]
     async fn provider_binding_and_status_are_journaled_atomically() {
         let path = temp_db_path("atomic-binding");
-        let store = Store::open(&path).await.unwrap();
+        let store = Store::open(&path, "bsinst_test").await.unwrap();
         let conn = store.conn().unwrap();
         let job = send_job(
             "local-1",
@@ -980,6 +1182,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_queries_restore_each_durable_dispatch_state() {
+        let path = temp_db_path("restart-states");
+        let store = Store::open(&path, "bsinst_test").await.unwrap();
+        let conn = store.conn().unwrap();
+        let queued = send_job("queued", None, SendTarget::Handle { to: "q".into() });
+        let dispatching = send_job("dispatching", None, SendTarget::Handle { to: "d".into() });
+        let sent_unbound = send_job("sent-unbound", None, SendTarget::Handle { to: "s".into() });
+        let bound = send_job("bound", None, SendTarget::Handle { to: "b".into() });
+        let unknown = send_job("unknown", None, SendTarget::Handle { to: "u".into() });
+
+        for job in [&queued, &dispatching, &sent_unbound, &bound, &unknown] {
+            accept_and_record_queued(&conn, job).await.unwrap();
+        }
+        mark_dispatching(&conn, &dispatching.message_id, 10)
+            .await
+            .unwrap();
+        mark_dispatching(&conn, &sent_unbound.message_id, 20)
+            .await
+            .unwrap();
+        record_sent_acceptance(&conn, &sent_unbound).await.unwrap();
+        mark_dispatching(&conn, &bound.message_id, 30)
+            .await
+            .unwrap();
+        record_sent_acceptance(&conn, &bound).await.unwrap();
+        bind_and_record_sent(
+            &conn,
+            &bound.message_id,
+            31,
+            "provider-bound",
+            Some("chat-bound"),
+        )
+        .await
+        .unwrap();
+        mark_dispatching(&conn, &unknown.message_id, 40)
+            .await
+            .unwrap();
+        record_unknown(&conn, &unknown, "restart uncertainty")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            next_queued(&conn).await.unwrap().unwrap().job.message_id,
+            "queued"
+        );
+        let recoverable = recoverable_sends(&conn).await.unwrap();
+        assert_eq!(
+            recoverable
+                .iter()
+                .map(|send| (send.job.message_id.as_str(), send.dispatch_state.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("dispatching", "dispatching"),
+                ("sent-unbound", "sent_unbound")
+            ]
+        );
+        assert_eq!(
+            active_provider_guids(&conn).await.unwrap(),
+            vec!["provider-bound"]
+        );
+        assert!(!recoverable
+            .iter()
+            .any(|send| matches!(send.job.message_id.as_str(), "bound" | "unknown")));
+    }
+
+    #[tokio::test]
     async fn migrates_legacy_tables_without_losing_events() {
         let path = temp_db_path("legacy-migration");
         let db = Builder::new_local(&path).build().await.unwrap();
@@ -1000,20 +1267,38 @@ mod tests {
                (event, message_id, timestamp, payload_json, created_at)
              VALUES ('message.received', 'legacy-guid', '2026-01-01T00:00:00Z',
                      '{\"event\":\"message.received\",\"message_id\":\"legacy-guid\",\"timestamp\":\"2026-01-01T00:00:00Z\"}',
-                     '2026-01-01T00:00:00Z');",
+                     '2026-01-01T00:00:00Z');
+             INSERT INTO outbound
+               (message_id, client_ref, handle, protocol, pre_rowid, last_status, created_at)
+             VALUES ('legacy-local', 'correlation-only', '+15550000001', 'imessage', 0,
+                     'sent', '2026-01-01T00:00:00Z');",
         )
         .await
         .unwrap();
         drop(conn);
         drop(db);
 
-        let store = Store::open(&path).await.unwrap();
+        let store = Store::open(&path, "bsinst_test").await.unwrap();
         let conn = store.conn().unwrap();
         let events = list_events_since(&conn, 0, None).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].message_id, "legacy-guid");
         assert!(events[0].provider_message_id.is_none());
         assert!(events[0].chat_id.is_none());
+        assert_eq!(events[0].installation_id, "bsinst_test");
+
+        let post_upgrade = send_job(
+            "post-upgrade",
+            Some("correlation-only"),
+            SendTarget::Handle {
+                to: "+15550000002".to_string(),
+            },
+        );
+        let accepted = accept_and_record_queued(&conn, &post_upgrade)
+            .await
+            .unwrap();
+        assert!(accepted.is_new);
+        assert_eq!(accepted.message_id, "post-upgrade");
 
         let mut rows = conn.query("PRAGMA table_info(outbound)", ()).await.unwrap();
         let mut columns = Vec::new();

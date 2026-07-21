@@ -88,6 +88,7 @@ async fn get_health(State(state): State<AppState>) -> impl IntoResponse {
         "status": "ok",
         "product": "blueski",
         "version": env!("CARGO_PKG_VERSION"),
+        "installation_id": state.config.installation_id,
         "port": state.config.port,
         "authentication_required": state.config.api_token.is_some(),
     }))
@@ -170,6 +171,16 @@ async fn post_messages(State(state): State<AppState>, Json(req): Json<SendReques
     };
     let accepted = match store::accept_and_record_queued(&conn, &job).await {
         Ok(accepted) => accepted,
+        Err(error) if error.downcast_ref::<store::IdempotencyConflict>().is_some() => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": error.to_string(),
+                    "client_ref": job.client_ref,
+                })),
+            )
+                .into_response();
+        }
         Err(error) => return internal_error(error),
     };
     if let Some(journaled) = accepted.journaled {
@@ -186,6 +197,7 @@ async fn post_messages(State(state): State<AppState>, Json(req): Json<SendReques
         Json(json!({
             "message_id": accepted.message_id,
             "status": accepted.status,
+            "idempotent": accepted.idempotent,
         })),
     )
         .into_response()
@@ -279,14 +291,18 @@ async fn stream_events(State(state): State<AppState>, Query(q): Query<EventsQuer
 }
 
 async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
+    let webhooks = state.event_sink.webhook_statuses();
     Json(json!({
         "status": "ok",
         "product": "blueski",
         "version": env!("CARGO_PKG_VERSION"),
+        "installation_id": state.config.installation_id,
         "transport": "applescript",
         "uptime_secs": state.start.elapsed().as_secs(),
         "port": state.config.port,
-        "webhook_configured": state.config.webhook_url.is_some(),
+        "webhook_configured": !webhooks.is_empty(),
+        "webhook_count": webhooks.len(),
+        "webhooks": webhooks,
         "permissions": {
             "checked": state.permissions.checked(),
             "full_disk_access": state.permissions.full_disk_access(),
@@ -315,8 +331,7 @@ mod tests {
         let (events, _) = broadcast::channel(16);
         let event_sink = crate::webhook::spawn(
             reqwest::Client::new(),
-            None,
-            "test-secret".to_string(),
+            Vec::new(),
             store.clone(),
             events.clone(),
         );
@@ -334,7 +349,9 @@ mod tests {
 
     #[tokio::test]
     async fn events_endpoint_returns_journaled_events() {
-        let store = Store::open(&temp_db_path("events-route")).await.unwrap();
+        let store = Store::open(&temp_db_path("events-route"), "bsinst_test")
+            .await
+            .unwrap();
         let conn = store.conn().unwrap();
         let mut ev = Event::new("message.received", "msg-1".to_string());
         ev.text = Some("hello".to_string());
@@ -361,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn messages_endpoint_rejects_missing_target() {
-        let store = Store::open(&temp_db_path("messages-missing-target"))
+        let store = Store::open(&temp_db_path("messages-missing-target"), "bsinst_test")
             .await
             .unwrap();
         let app = router(test_state(store).await);
@@ -382,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn messages_endpoint_rejects_ambiguous_target() {
-        let store = Store::open(&temp_db_path("messages-ambiguous-target"))
+        let store = Store::open(&temp_db_path("messages-ambiguous-target"), "bsinst_test")
             .await
             .unwrap();
         let app = router(test_state(store).await);
@@ -405,7 +422,7 @@ mod tests {
 
     #[tokio::test]
     async fn messages_endpoint_commits_before_202_and_replays_client_ref() {
-        let store = Store::open(&temp_db_path("messages-idempotent"))
+        let store = Store::open(&temp_db_path("messages-idempotent"), "bsinst_test")
             .await
             .unwrap();
         let app = router(test_state(store.clone()).await);
@@ -426,8 +443,10 @@ mod tests {
         assert_eq!(first.status(), StatusCode::ACCEPTED);
         let first_body = to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
         let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["idempotent"], true);
 
         let replay = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -442,6 +461,22 @@ mod tests {
         let replay_body = to_bytes(replay.into_body(), 1024 * 1024).await.unwrap();
         let replay_json: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
         assert_eq!(replay_json["message_id"], first_json["message_id"]);
+        assert_eq!(replay_json["idempotent"], true);
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"to":"+15550000001","text":"changed","client_ref":"outbox-42"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
 
         let conn = store.conn().unwrap();
         let queued = store::next_queued(&conn).await.unwrap().unwrap();
@@ -453,7 +488,9 @@ mod tests {
 
     #[tokio::test]
     async fn message_collection_and_detail_are_public_routes() {
-        let store = Store::open(&temp_db_path("message-routes")).await.unwrap();
+        let store = Store::open(&temp_db_path("message-routes"), "bsinst_test")
+            .await
+            .unwrap();
         let conn = store.conn().unwrap();
         let event = Event::new("message.sent", "message-1".to_string());
         store::record_event(&conn, &event).await.unwrap();
@@ -485,7 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_applescript_as_the_only_transport() {
-        let store = Store::open(&temp_db_path("status-transport"))
+        let store = Store::open(&temp_db_path("status-transport"), "bsinst_test")
             .await
             .unwrap();
         let app = router(test_state(store).await);
@@ -504,11 +541,60 @@ mod tests {
         let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(status["transport"], "applescript");
         assert_eq!(status["product"], "blueski");
+        assert!(status["installation_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("bsinst_"));
+        assert_eq!(status["webhook_count"], 0);
+        assert!(status["webhooks"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_exposes_only_safe_webhook_metadata() {
+        let store = Store::open(&temp_db_path("status-webhooks"), "bsinst_test")
+            .await
+            .unwrap();
+        let mut state = test_state(store.clone()).await;
+        let webhook = crate::config::WebhookConfig {
+            id: "audit".to_string(),
+            url: "https://events.example.com/private".to_string(),
+            secret: "never-return-this".to_string(),
+            enabled: true,
+        };
+        state.config = Arc::new(Config {
+            webhooks: vec![webhook.clone()],
+            ..Config::default()
+        });
+        state.event_sink = crate::webhook::spawn(
+            reqwest::Client::new(),
+            vec![webhook],
+            store,
+            state.events.clone(),
+        );
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let raw = String::from_utf8(body.to_vec()).unwrap();
+        let status: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(status["webhook_count"], 1);
+        assert_eq!(status["webhooks"][0]["id"], "audit");
+        assert!(!raw.contains("events.example.com"));
+        assert!(!raw.contains("never-return-this"));
     }
 
     #[tokio::test]
     async fn health_is_fast_and_side_effect_free() {
-        let store = Store::open(&temp_db_path("health-route")).await.unwrap();
+        let store = Store::open(&temp_db_path("health-route"), "bsinst_test")
+            .await
+            .unwrap();
         let app = router(test_state(store).await);
         let response = app
             .oneshot(
@@ -524,12 +610,18 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(health["product"], "blueski");
+        assert!(health["installation_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("bsinst_"));
         assert!(health.get("permissions").is_none());
     }
 
     #[tokio::test]
     async fn configured_bearer_token_protects_every_route() {
-        let store = Store::open(&temp_db_path("auth-route")).await.unwrap();
+        let store = Store::open(&temp_db_path("auth-route"), "bsinst_test")
+            .await
+            .unwrap();
         let mut state = test_state(store).await;
         let config = Config {
             api_token: Some("test-secret".to_string()),
