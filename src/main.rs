@@ -36,6 +36,9 @@ enum Command {
         /// Recipient handle — E.164 phone or iMessage email.
         #[arg(long)]
         to: Option<String>,
+        /// Stable Messages conversation id (`chat.guid`).
+        #[arg(long, conflicts_with = "to")]
+        chat_id: Option<String>,
         /// Message body.
         #[arg(long)]
         text: Option<String>,
@@ -96,11 +99,12 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Send {
             to,
+            chat_id,
             text,
             protocol,
             client_ref,
             positional,
-        } => send(to, text, protocol, client_ref, positional),
+        } => send(to, chat_id, text, protocol, client_ref, positional),
         Command::Events {
             since,
             limit,
@@ -150,25 +154,41 @@ fn events(since: i64, limit: Option<u64>, follow: bool) -> Result<()> {
 /// in the daemon — this is just a convenient front door for agents.
 fn send(
     to: Option<String>,
+    chat_id: Option<String>,
     text: Option<String>,
     protocol: String,
     client_ref: Option<String>,
     positional: Vec<String>,
 ) -> Result<()> {
-    let to = to.or_else(|| positional.first().cloned());
-    let text = text.or_else(|| positional.get(1).cloned());
-    let (to, text) = match (to, text) {
-        (Some(to), Some(text)) => (to, text),
-        _ => anyhow::bail!(
-            "usage: blueski send --to <handle> --text <message> [--protocol imessage]"
-        ),
+    let to = to.or_else(|| {
+        if chat_id.is_none() {
+            positional.first().cloned()
+        } else {
+            None
+        }
+    });
+    let text = text.or_else(|| {
+        if chat_id.is_some() {
+            positional.first().cloned()
+        } else {
+            positional.get(1).cloned()
+        }
+    });
+    let Some(text) = text else {
+        anyhow::bail!(
+            "usage: blueski send (--to <handle> | --chat-id <chat.guid>) --text <message>"
+        );
     };
+    if to.is_some() == chat_id.is_some() {
+        anyhow::bail!("provide exactly one of --to or --chat-id");
+    }
 
     let config = Config::load_or_init()?;
     ensure_running(&config)?;
 
     let body = serde_json::json!({
         "to": to,
+        "chat_id": chat_id,
         "text": text,
         "protocol": protocol,
         "client_ref": client_ref,
@@ -398,6 +418,13 @@ async fn async_run() -> Result<()> {
 
     // Correlation store (Turso/libSQL) binding our message_id <-> chat.db guid.
     let store = store::Store::open(&config::store_path().to_string_lossy()).await?;
+    let active_provider_guids = match store::active_provider_guids(&store.conn()?).await {
+        Ok(guids) => guids,
+        Err(error) => {
+            tracing::warn!(%error, "failed to restore active provider status polling");
+            Vec::new()
+        }
+    };
     let (event_tx, _) = tokio::sync::broadcast::channel(1024);
 
     let client = reqwest::Client::builder()
@@ -415,7 +442,7 @@ async fn async_run() -> Result<()> {
     // worker reads it as the pre-send lower bound for claim-by-watermark.
     let max_rowid = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
 
-    // Send path: control socket -> in-memory queue -> AppleScript -> Messages.
+    // Send path: state.db durable queue -> wake signal -> AppleScript -> Messages.
     let (send_tx, send_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(send_worker::run(
         send_rx,
@@ -437,6 +464,7 @@ async fn async_run() -> Result<()> {
         sink.clone(),
         corr_tx,
         max_rowid.clone(),
+        active_provider_guids,
     );
 
     let state = AppState {
@@ -446,6 +474,7 @@ async fn async_run() -> Result<()> {
         config: config.clone(),
         store: store.clone(),
         events: event_tx,
+        event_sink: sink,
         permissions: permissions::PermissionState::default(),
     };
 

@@ -33,10 +33,15 @@ const BACKSTOP_INTERVAL: Duration = Duration::from_secs(10);
 // the send worker after AppleScript returns; this scanner only observes status.
 const QUERY: &str = "\
 SELECT m.ROWID, m.guid, h.id, m.text, m.attributedBody, m.date, \
-       m.is_from_me, m.is_delivered, m.is_read, m.date_delivered, m.date_read \
+       m.is_from_me, m.is_delivered, m.is_read, m.date_delivered, m.date_read, \
+       CASE WHEN COUNT(DISTINCT c.guid) = 1 THEN MIN(c.guid) ELSE NULL END, \
+       COUNT(DISTINCT c.guid), m.service \
 FROM message m \
 LEFT JOIN handle h ON m.handle_id = h.ROWID \
+LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID \
+LEFT JOIN chat c ON c.ROWID = cmj.chat_id \
 WHERE m.ROWID > ?1 \
+GROUP BY m.ROWID \
 ORDER BY m.ROWID ASC";
 
 struct Row {
@@ -51,6 +56,9 @@ struct Row {
     is_read: i64,
     date_delivered: i64,
     date_read: i64,
+    chat_id: Option<String>,
+    chat_guid_count: i64,
+    service: Option<String>,
 }
 
 /// Everything the receive worker carries across a scan.
@@ -77,10 +85,11 @@ pub fn spawn(
     sink: EventSink,
     corr_tx: UnboundedSender<CorrEvent>,
     max_rowid: Arc<AtomicI64>,
+    active_guids: Vec<String>,
 ) {
     std::thread::Builder::new()
         .name("receive".into())
-        .spawn(move || worker(chatdb, wal, sink, corr_tx, max_rowid))
+        .spawn(move || worker(chatdb, wal, sink, corr_tx, max_rowid, active_guids))
         .expect("spawn receive thread");
 }
 
@@ -90,6 +99,7 @@ fn worker(
     sink: EventSink,
     corr_tx: UnboundedSender<CorrEvent>,
     max_rowid: Arc<AtomicI64>,
+    active_guids: Vec<String>,
 ) {
     let conn = match open_reader(&chatdb) {
         Ok(c) => c,
@@ -103,7 +113,9 @@ fn worker(
     // First run: start from the current tail so we don't replay all history.
     if state.last_seen == 0 {
         state.last_seen = max_rowid_db(&conn).unwrap_or(0);
-        state.save();
+        if let Err(error) = state.save() {
+            tracing::warn!(%error, "failed to persist initial receive watermark");
+        }
         tracing::info!(last_seen = state.last_seen, "initialized receive watermark");
     }
     max_rowid.store(state.last_seen, Ordering::Relaxed);
@@ -113,7 +125,7 @@ fn worker(
         corr_tx,
         sink,
         max_rowid,
-        active: HashMap::new(),
+        active: active_guids.into_iter().map(|guid| (guid, 0)).collect(),
     };
 
     // kqueue subscription on chat.db-wal — wakes us on every WAL commit.
@@ -188,16 +200,25 @@ fn scan(ctx: &mut Ctx, state: &mut State) {
             "scan: new rows"
         );
     }
-    let mut advanced = false;
     for row in rows {
-        if row.rowid > state.last_seen {
-            state.last_seen = row.rowid;
-            advanced = true;
+        if row.rowid <= state.last_seen {
+            continue;
         }
-        handle_row(ctx, row);
-    }
-    if advanced {
-        state.save();
+        let rowid = row.rowid;
+        if !handle_row(ctx, row) {
+            tracing::warn!(rowid, "scan stopped before receive watermark advanced");
+            break;
+        }
+
+        let mut next = state.clone();
+        next.last_seen = rowid;
+        if let Err(error) = next.save() {
+            // The event may already be journaled. Retrying this row is an
+            // intentional at-least-once duplicate, preferable to skipping it.
+            tracing::warn!(%error, rowid, "failed to persist receive watermark");
+            break;
+        }
+        *state = next;
         ctx.max_rowid.store(state.last_seen, Ordering::Relaxed);
     }
 }
@@ -218,26 +239,46 @@ fn read_rows(conn: &Connection, last_seen: i64) -> rusqlite::Result<Vec<Row>> {
                 is_read: r.get(8)?,
                 date_delivered: r.get(9)?,
                 date_read: r.get(10)?,
+                chat_id: r.get(11)?,
+                chat_guid_count: r.get(12)?,
+                service: r.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-fn handle_row(ctx: &mut Ctx, row: Row) {
+/// Return true only when it is safe to advance the durable receive watermark.
+fn handle_row(ctx: &mut Ctx, row: Row) -> bool {
     if row.is_from_me == 0 {
         // Inbound: prefer `text`, fall back to the attributedBody blob.
         let text = row
             .text
             .filter(|s| !s.is_empty())
             .or_else(|| row.body.as_deref().and_then(decode_attributed_body));
+        if row.chat_guid_count != 1 {
+            tracing::warn!(
+                message_guid = %row.guid,
+                chat_guid_count = row.chat_guid_count,
+                "inbound message does not have exactly one chat GUID"
+            );
+        }
+        let provider_message_id = row.guid.clone();
         let mut ev = Event::new("message.received", row.guid);
+        ev.provider_message_id = Some(provider_message_id);
         ev.handle = row.handle;
+        ev.chat_id = row.chat_id;
         ev.text = text;
-        ev.protocol = Some("imessage".to_string());
+        ev.protocol = Some(normalize_service(row.service.as_deref()));
+        ev.status = Some("received".to_string());
         ev.timestamp = apple_time_to_iso(row.date).unwrap_or_else(now_iso);
-        ctx.sink.emit(ev);
-        return;
+        return match ctx.sink.emit_blocking(ev) {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(%error, "failed to durably journal inbound message");
+                false
+            }
+        };
     }
 
     // Outbound: forward its current status. Track the guid for delivered/read
@@ -251,6 +292,17 @@ fn handle_row(ctx: &mut Ctx, row: Row) {
     });
     if status != "read" {
         ctx.active.entry(row.guid).or_insert(0);
+    }
+    true
+}
+
+fn normalize_service(service: Option<&str>) -> String {
+    match service.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if value.eq_ignore_ascii_case("iMessage") => "imessage".to_string(),
+        Some(value) if value.eq_ignore_ascii_case("SMS") => "sms".to_string(),
+        Some(value) if value.eq_ignore_ascii_case("RCS") => "rcs".to_string(),
+        Some(value) => value.to_lowercase(),
+        None => "imessage".to_string(),
     }
 }
 
@@ -383,4 +435,61 @@ pub(crate) fn decode_attributed_body(blob: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_messages_services_without_mislabeling_unknown_values() {
+        assert_eq!(normalize_service(Some("iMessage")), "imessage");
+        assert_eq!(normalize_service(Some("SMS")), "sms");
+        assert_eq!(normalize_service(Some("rcs")), "rcs");
+        assert_eq!(normalize_service(Some("Satellite")), "satellite");
+        assert_eq!(normalize_service(None), "imessage");
+    }
+
+    #[tokio::test]
+    async fn inbound_query_exposes_only_unambiguous_chat_guids() {
+        // libSQL and rusqlite share the bundled SQLite process state. The
+        // daemon initializes libSQL first, so mirror that order here before
+        // opening the chat.db-shaped rusqlite fixture.
+        let state_path = std::env::temp_dir()
+            .join(format!("blueski-receive-query-{}.db", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let _store = crate::store::Store::open(&state_path).await.unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                 ROWID INTEGER PRIMARY KEY, guid TEXT NOT NULL, handle_id INTEGER,
+                 text TEXT, attributedBody BLOB, date INTEGER NOT NULL,
+                 is_from_me INTEGER NOT NULL, is_delivered INTEGER NOT NULL,
+                 is_read INTEGER NOT NULL, date_delivered INTEGER NOT NULL,
+                 date_read INTEGER NOT NULL, service TEXT
+             );
+             CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+             CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT);
+             CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+             INSERT INTO handle VALUES (1, '+15550000001');
+             INSERT INTO chat VALUES (10, 'iMessage;-;direct');
+             INSERT INTO chat VALUES (11, 'iMessage;+;group-a');
+             INSERT INTO chat VALUES (12, 'iMessage;+;group-b');
+             INSERT INTO message VALUES
+               (1, 'provider-1', 1, 'one', NULL, 1, 0, 0, 0, 0, 0, 'iMessage'),
+               (2, 'provider-2', 1, 'two', NULL, 2, 0, 0, 0, 0, 0, 'SMS');
+             INSERT INTO chat_message_join VALUES (10, 1), (11, 2), (12, 2);",
+        )
+        .unwrap();
+
+        let rows = read_rows(&conn, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].chat_id.as_deref(), Some("iMessage;-;direct"));
+        assert_eq!(rows[0].chat_guid_count, 1);
+        assert_eq!(rows[0].service.as_deref(), Some("iMessage"));
+        assert!(rows[1].chat_id.is_none());
+        assert_eq!(rows[1].chat_guid_count, 2);
+        assert_eq!(rows[1].service.as_deref(), Some("SMS"));
+    }
 }

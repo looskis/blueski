@@ -19,7 +19,7 @@ pub struct SendRequest {
     pub client_ref: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendTarget {
     Handle { to: String },
     Chat { chat_id: String },
@@ -39,11 +39,33 @@ impl SendTarget {
             SendTarget::Chat { .. } => None,
         }
     }
+
+    pub fn event_chat_id(&self) -> Option<String> {
+        match self {
+            SendTarget::Handle { .. } => None,
+            SendTarget::Chat { chat_id } => Some(chat_id.clone()),
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SendTarget::Handle { .. } => "handle",
+            SendTarget::Chat { .. } => "chat",
+        }
+    }
+
+    pub fn from_parts(kind: &str, value: String) -> Option<Self> {
+        match kind {
+            "handle" => Some(SendTarget::Handle { to: value }),
+            "chat" => Some(SendTarget::Chat { chat_id: value }),
+            _ => None,
+        }
+    }
 }
 
-/// A unit of work handed from the control socket to the send worker over the
-/// in-process channel. Not an IPC boundary — same process.
-#[derive(Debug, Clone)]
+/// A complete durable outbound command. It is persisted before the HTTP 202;
+/// the in-process channel only wakes the worker to load it from `state.db`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendJob {
     pub message_id: String,
     pub target: SendTarget,
@@ -59,9 +81,13 @@ pub struct Event {
     pub event: String,
     pub message_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,8 +104,10 @@ impl Event {
         Event {
             event: event.to_string(),
             message_id,
+            provider_message_id: None,
             client_ref: None,
             handle: None,
+            chat_id: None,
             text: None,
             protocol: None,
             status: None,

@@ -79,6 +79,7 @@ blueski status
 blueski doctor
 blueski up
 blueski send --to "+14155551234" --text "hello"
+blueski send --chat-id "iMessage;-;chat-guid" --text "reply to this chat"
 blueski send "+14155551234" "positional form"
 blueski events --since 0
 blueski events --follow
@@ -112,8 +113,16 @@ Content-Type: application/json
 }
 ```
 
-Use exactly one of `to` or `chat_id`. A successful queue operation returns
-`202 Accepted` with a generated `message_id`.
+Use exactly one of `to` or `chat_id`. `chat_id` is the stable `chat.guid`
+returned on events and works for direct and group conversations. A successful
+queue operation returns `202 Accepted` with a generated `message_id` only after
+the complete job and its `message.queued` event have committed to `state.db`.
+
+`client_ref` is an installation-scoped idempotency key when it is non-null.
+Repeating a request with the same value returns the original `message_id` and
+does not dispatch another message. Existing installations may have reused
+`client_ref` as a correlation-only value; migration keeps one existing binding
+for each such value without modifying historical event rows.
 
 Other endpoints:
 
@@ -127,6 +136,27 @@ Other endpoints:
 Events include `message.queued`, `message.sent`, `message.failed`,
 `message.received`, and `message.status`. If `webhook_url` is configured, the
 same events are POSTed with an `X-Blueski-Signature` HMAC-SHA256 header.
+
+Every webhook body is the same journaled envelope returned by `GET /events`,
+including its local cursor `id`, `created_at`, optional `chat_id`, and optional
+`provider_message_id`. The signature covers those exact raw JSON bytes.
+
+Lifecycle semantics:
+
+- `message.sent` means Messages.app accepted the AppleScript send.
+- `message.status` with `status=sent` means BlueSki resolved and durably bound
+  the Apple message GUID and Messages chat GUID.
+- Later `message.status` events report `delivered` and `read`.
+- `status=unknown` means BlueSki restarted or reconciliation failed inside the
+  unavoidable AppleScript uncertainty window; it will not blindly resend and
+  risk a duplicate.
+
+Inbound events are journaled at least once before the Messages receive
+watermark advances. Journal entries are replayable by cursor. Webhook delivery
+is best effort; consumers recover gaps through `/events?since=<cursor>` and
+deduplicate deliveries by `(installation, event.id)`. If a crash causes the
+same inbound provider message to be journaled again, deduplicate its semantic
+processing by `(installation, provider_message_id, event kind/status)`.
 
 ## Configuration and state
 
@@ -158,8 +188,12 @@ bash -n scripts/*.sh
 ```
 
 For a real outbound test, copy `.env.example` to `.env`, set
-`TEST_RECIPIENT`, and run `scripts/smoke.sh`. This sends a real message and
-requires working Messages permissions.
+`TEST_RECIPIENT`, and run `scripts/smoke.sh`. This sends two UUID-tagged real
+messages: the first by handle, then a second using the exact resolved
+`chat.guid`. It verifies `client_ref` retry idempotency, provider correlation,
+matching inbound self-send events, and the chat identity round trip. Set
+`BLUESKI_E2E_USE_SUPERVISOR=1` to exercise the signed launchd-managed app and
+its macOS permissions.
 
 ## Homebrew release checklist
 

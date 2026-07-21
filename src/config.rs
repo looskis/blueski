@@ -12,6 +12,9 @@ fn home() -> PathBuf {
 }
 
 pub fn config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("BLUESKI_CONFIG_DIR").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
     home().join(".config/blueski")
 }
 
@@ -92,19 +95,26 @@ impl Config {
     /// Load config, creating a default (with a fresh hmac secret) on first run.
     pub fn load_or_init() -> Result<Config> {
         let path = config_path();
-        if path.exists() {
+        let mut config = if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let config = toml::from_str(&raw)?;
             secure_config_file(&path)?;
-            Ok(config)
+            config
         } else {
             let cfg = Config::default();
             std::fs::create_dir_all(config_dir())?;
             cfg.save()?;
             tracing::info!(path = %path.display(), "wrote default config");
-            Ok(cfg)
+            cfg
+        };
+        if let Some(port) = std::env::var_os("BLUESKI_PORT") {
+            config.port = port
+                .to_string_lossy()
+                .parse()
+                .context("BLUESKI_PORT must be a valid TCP port")?;
         }
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -139,11 +149,20 @@ impl State {
             .unwrap_or_default()
     }
 
-    pub fn save(&self) {
-        if let Err(e) = std::fs::create_dir_all(config_dir()).and_then(|_| {
-            std::fs::write(state_path(), serde_json::to_vec(self).unwrap_or_default())
-        }) {
-            tracing::warn!(error = %e, "failed to persist state");
+    pub fn save(&self) -> Result<()> {
+        use std::io::Write;
+
+        let dir = config_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = state_path();
+        let temp = dir.join(format!("state.json.{}.tmp", std::process::id()));
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(&serde_json::to_vec(self)?)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &path)?;
+        if let Ok(dir_file) = std::fs::File::open(&dir) {
+            let _ = dir_file.sync_all();
         }
+        Ok(())
     }
 }

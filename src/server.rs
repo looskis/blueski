@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::model::{SendJob, SendRequest, SendTarget};
 use crate::permissions;
 use crate::store::{self, JournaledEvent, Store};
+use crate::webhook::EventSink;
 use axum::{
     body::Body,
     extract::{Path, Query, Request, State},
@@ -26,12 +27,13 @@ use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub send_tx: mpsc::UnboundedSender<SendJob>,
+    pub send_tx: mpsc::UnboundedSender<()>,
     pub start: Instant,
     pub chatdb: PathBuf,
     pub config: Arc<Config>,
     pub store: Store,
     pub events: broadcast::Sender<JournaledEvent>,
+    pub event_sink: EventSink,
     pub permissions: permissions::PermissionState,
 }
 
@@ -133,10 +135,7 @@ async fn get_debug_chatdb(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn post_messages(
-    State(state): State<AppState>,
-    Json(req): Json<SendRequest>,
-) -> impl IntoResponse {
+async fn post_messages(State(state): State<AppState>, Json(req): Json<SendRequest>) -> Response {
     let target = match (req.to, req.chat_id) {
         (Some(to), None) => SendTarget::Handle { to },
         (None, Some(chat_id)) => SendTarget::Chat { chat_id },
@@ -144,13 +143,15 @@ async fn post_messages(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "provide either to or chat_id, not both" })),
-            );
+            )
+                .into_response();
         }
         (None, None) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "provide to or chat_id" })),
-            );
+            )
+                .into_response();
         }
     };
 
@@ -163,17 +164,31 @@ async fn post_messages(
         client_ref: req.client_ref,
     };
 
-    if state.send_tx.send(job).is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "send worker unavailable" })),
-        );
+    let conn = match state.store.conn() {
+        Ok(conn) => conn,
+        Err(error) => return internal_error(error),
+    };
+    let accepted = match store::accept_and_record_queued(&conn, &job).await {
+        Ok(accepted) => accepted,
+        Err(error) => return internal_error(error),
+    };
+    if let Some(journaled) = accepted.journaled {
+        state.event_sink.publish_committed(journaled);
+    }
+
+    if accepted.is_new && state.send_tx.send(()).is_err() {
+        // The command is already durable. A restarted worker will recover it.
+        tracing::warn!(message_id = %accepted.message_id, "send worker wake-up channel is closed");
     }
 
     (
         StatusCode::ACCEPTED,
-        Json(json!({ "message_id": message_id, "status": "queued" })),
+        Json(json!({
+            "message_id": accepted.message_id,
+            "status": accepted.status,
+        })),
     )
+        .into_response()
 }
 
 async fn get_events(
@@ -298,6 +313,13 @@ mod tests {
     async fn test_state(store: Store) -> AppState {
         let (send_tx, _send_rx) = mpsc::unbounded_channel();
         let (events, _) = broadcast::channel(16);
+        let event_sink = crate::webhook::spawn(
+            reqwest::Client::new(),
+            None,
+            "test-secret".to_string(),
+            store.clone(),
+            events.clone(),
+        );
         AppState {
             send_tx,
             start: Instant::now(),
@@ -305,6 +327,7 @@ mod tests {
             config: Arc::new(Config::default()),
             store,
             events,
+            event_sink,
             permissions: permissions::PermissionState::default(),
         }
     }
@@ -378,6 +401,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn messages_endpoint_commits_before_202_and_replays_client_ref() {
+        let store = Store::open(&temp_db_path("messages-idempotent"))
+            .await
+            .unwrap();
+        let app = router(test_state(store.clone()).await);
+        let request_body = r#"{"to":"+15550000001","text":"hello","client_ref":"outbox-42"}"#;
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_body = to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let replay_body = to_bytes(replay.into_body(), 1024 * 1024).await.unwrap();
+        let replay_json: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+        assert_eq!(replay_json["message_id"], first_json["message_id"]);
+
+        let conn = store.conn().unwrap();
+        let queued = store::next_queued(&conn).await.unwrap().unwrap();
+        assert_eq!(queued.job.message_id, first_json["message_id"]);
+        let events = store::list_events_since(&conn, 0, None).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "message.queued");
     }
 
     #[tokio::test]

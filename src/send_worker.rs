@@ -6,7 +6,7 @@
 //! it resolves the created row from chat.db and binds that exact guid back to
 //! our `message_id`.
 
-use crate::model::{now_iso, Event, SendJob, SendTarget};
+use crate::model::{SendJob, SendTarget};
 use crate::receive::{decode_attributed_body, open_reader};
 use crate::sender::Sender;
 use crate::store::{self, Store};
@@ -23,7 +23,7 @@ const RESOLVE_ATTEMPTS: u32 = 32;
 const RESOLVE_INTERVAL: Duration = Duration::from_millis(250);
 
 pub async fn run<S: Sender>(
-    mut rx: mpsc::UnboundedReceiver<SendJob>,
+    mut wake_rx: mpsc::UnboundedReceiver<()>,
     sender: S,
     sink: EventSink,
     store: Store,
@@ -31,119 +31,178 @@ pub async fn run<S: Sender>(
     chatdb: PathBuf,
 ) {
     let store_conn = match store.conn() {
-        Ok(c) => Some(c),
+        Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, "correlation store unavailable — sends won't be bound");
-            None
+            tracing::error!(error = %e, "durable send store unavailable — send worker stopped");
+            return;
         }
     };
 
-    while let Some(job) = rx.recv().await {
-        // Capture the freshest watermark BEFORE the send. The receive worker's
-        // atomic is a useful fallback, but it can lag behind chat.db during a
-        // burst; querying here narrows the resolver window.
-        let pre = match current_max_rowid(&chatdb).await {
-            Ok(rowid) => {
-                max_rowid.fetch_max(rowid, Ordering::Relaxed);
-                rowid
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to read chat.db watermark; falling back to receive watermark");
-                max_rowid.load(Ordering::Relaxed)
-            }
-        };
+    if let Err(error) = recover_inflight(&store_conn, &sink, &chatdb, &max_rowid).await {
+        tracing::warn!(%error, "failed to reconcile in-flight sends at startup");
+    }
 
-        if let Some(conn) = &store_conn {
-            if let Err(e) = store::record_pending(
-                conn,
-                &job.message_id,
-                job.client_ref.as_deref(),
-                job.target.store_key(),
-                &job.protocol,
-                pre,
-                &now_iso(),
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "failed to record pending send");
+    loop {
+        loop {
+            match store::next_queued(&store_conn).await {
+                Ok(Some(send)) => {
+                    process_queued(&store_conn, &sender, &sink, &chatdb, &max_rowid, send.job)
+                        .await;
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to load durable send queue");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         }
 
-        sink.emit(queued_event(&job));
+        if wake_rx.recv().await.is_none() {
+            break;
+        }
+    }
+}
 
-        match sender.send(&job).await {
-            Ok(()) => {
-                sink.emit(terminal_event("message.sent", &job, None));
-                if let Some(conn) = &store_conn {
-                    match resolve_sent_row(chatdb.clone(), job.clone(), pre).await {
-                        Ok(Some(row)) => {
-                            match store::bind_resolved(conn, &job.message_id, row.rowid, &row.guid)
-                                .await
-                            {
-                                Ok(true) => {
-                                    max_rowid.fetch_max(row.rowid, Ordering::Relaxed);
-                                    tracing::info!(
-                                        message_id = %job.message_id,
-                                        guid = %row.guid,
-                                        rowid = row.rowid,
-                                        "bound outbound send"
-                                    );
-                                }
-                                Ok(false) => tracing::warn!(
-                                    message_id = %job.message_id,
-                                    guid = %row.guid,
-                                    "resolved send row but pending row was already bound"
-                                ),
-                                Err(e) => tracing::warn!(
-                                    message_id = %job.message_id,
-                                    guid = %row.guid,
-                                    error = %e,
-                                    "failed to persist send binding"
-                                ),
-                            }
-                        }
-                        Ok(None) => tracing::warn!(
-                            message_id = %job.message_id,
-                            "sent message accepted but no unique chat.db row could be resolved"
-                        ),
-                        Err(e) => tracing::warn!(
-                            message_id = %job.message_id,
-                            error = %e,
-                            "sent message accepted but chat.db row resolution failed"
-                        ),
-                    }
-                }
+async fn process_queued<S: Sender>(
+    conn: &libsql::Connection,
+    sender: &S,
+    sink: &EventSink,
+    chatdb: &Path,
+    max_rowid: &Arc<AtomicI64>,
+    job: SendJob,
+) {
+    // Capture the freshest watermark BEFORE dispatch. Persisting the
+    // `dispatching` claim before AppleScript creates an explicit crash window
+    // that startup reconciliation handles conservatively.
+    let pre = match current_max_rowid(chatdb).await {
+        Ok(rowid) => {
+            max_rowid.fetch_max(rowid, Ordering::Relaxed);
+            rowid
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to read chat.db watermark; falling back to receive watermark");
+            max_rowid.load(Ordering::Relaxed)
+        }
+    };
+    match store::mark_dispatching(conn, &job.message_id, pre).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::warn!(%error, message_id = %job.message_id, "failed to claim queued send");
+            return;
+        }
+    }
+
+    match sender.send(&job).await {
+        Ok(()) => {
+            match store::record_sent_acceptance(conn, &job).await {
+                Ok(event) => sink.publish_committed(event),
+                Err(error) => tracing::warn!(
+                    %error,
+                    message_id = %job.message_id,
+                    "failed to journal Messages.app acceptance"
+                ),
             }
-            Err(reason) => {
-                tracing::warn!(message_id = %job.message_id, error = %reason, "send failed");
-                sink.emit(terminal_event("message.failed", &job, Some(reason)));
+            resolve_and_finish(conn, sink, chatdb, max_rowid, job, pre).await;
+        }
+        Err(reason) => {
+            tracing::warn!(message_id = %job.message_id, error = %reason, "send failed");
+            match store::record_failed(conn, &job, reason).await {
+                Ok(event) => sink.publish_committed(event),
+                Err(error) => tracing::warn!(
+                    %error,
+                    message_id = %job.message_id,
+                    "failed to record send failure"
+                ),
             }
         }
     }
 }
 
-fn queued_event(job: &SendJob) -> Event {
-    let mut ev = Event::new("message.queued", job.message_id.clone());
-    ev.client_ref = job.client_ref.clone();
-    ev.handle = job.target.event_handle();
-    ev.text = Some(job.text.clone());
-    ev.protocol = Some(job.protocol.clone());
-    ev
+async fn recover_inflight(
+    conn: &libsql::Connection,
+    sink: &EventSink,
+    chatdb: &Path,
+    max_rowid: &Arc<AtomicI64>,
+) -> anyhow::Result<()> {
+    for send in store::recoverable_sends(conn).await? {
+        tracing::info!(
+            message_id = %send.job.message_id,
+            state = %send.dispatch_state,
+            "reconciling interrupted send"
+        );
+        resolve_and_finish(conn, sink, chatdb, max_rowid, send.job, send.pre_rowid).await;
+    }
+    Ok(())
 }
 
-fn terminal_event(name: &str, job: &SendJob, reason: Option<String>) -> Event {
-    let mut ev = Event::new(name, job.message_id.clone());
-    ev.client_ref = job.client_ref.clone();
-    ev.handle = job.target.event_handle();
-    ev.protocol = Some(job.protocol.clone());
-    ev.reason = reason;
-    ev
+async fn resolve_and_finish(
+    conn: &libsql::Connection,
+    sink: &EventSink,
+    chatdb: &Path,
+    max_rowid: &Arc<AtomicI64>,
+    job: SendJob,
+    pre_rowid: i64,
+) {
+    match resolve_sent_row(chatdb.to_path_buf(), job.clone(), pre_rowid).await {
+        Ok(Some(row)) => {
+            match store::bind_and_record_sent(
+                conn,
+                &job.message_id,
+                row.rowid,
+                &row.guid,
+                row.chat_id.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(event)) => {
+                    max_rowid.fetch_max(row.rowid, Ordering::Relaxed);
+                    tracing::info!(
+                        message_id = %job.message_id,
+                        guid = %row.guid,
+                        chat_id = ?row.chat_id,
+                        rowid = row.rowid,
+                        "bound outbound send"
+                    );
+                    sink.publish_committed(event);
+                }
+                Ok(None) => tracing::warn!(
+                    message_id = %job.message_id,
+                    guid = %row.guid,
+                    "resolved send row but outbound row was already bound"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    message_id = %job.message_id,
+                    guid = %row.guid,
+                    "failed to bind and journal resolved send"
+                ),
+            }
+        }
+        Ok(None) => {
+            let reason = "send outcome could not be reconciled without risking a duplicate";
+            tracing::warn!(message_id = %job.message_id, "{reason}");
+            match store::record_unknown(conn, &job, reason).await {
+                Ok(event) => sink.publish_committed(event),
+                Err(error) => tracing::warn!(%error, "failed to record unknown send outcome"),
+            }
+        }
+        Err(error) => {
+            let reason = format!("chat.db reconciliation failed: {error}");
+            tracing::warn!(message_id = %job.message_id, %reason);
+            match store::record_unknown(conn, &job, &reason).await {
+                Ok(event) => sink.publish_committed(event),
+                Err(error) => tracing::warn!(%error, "failed to record unknown send outcome"),
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 struct ResolvedRow {
     rowid: i64,
     guid: String,
+    chat_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -263,6 +322,7 @@ fn select_candidate(
         return Ok(ResolveAttempt::Unique(ResolvedRow {
             rowid: row.rowid,
             guid: row.guid.clone(),
+            chat_id: row.resolved_chat_id(target),
         }));
     }
     if strong.len() > 1 {
@@ -279,6 +339,7 @@ fn select_candidate(
         return Ok(ResolveAttempt::Unique(ResolvedRow {
             rowid: row.rowid,
             guid: row.guid.clone(),
+            chat_id: row.resolved_chat_id(target),
         }));
     }
 
@@ -322,6 +383,30 @@ impl CandidateRow {
             .as_deref()
             .map(|chat_guids| chat_guids.split(',').any(|candidate| candidate == chat_id))
             .unwrap_or(false)
+    }
+
+    fn distinct_chat_guids(&self) -> Vec<&str> {
+        let mut guids = self
+            .chat_guids_csv
+            .as_deref()
+            .into_iter()
+            .flat_map(|value| value.split(','))
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        guids.sort_unstable();
+        guids.dedup();
+        guids
+    }
+
+    fn resolved_chat_id(&self, target: &SendTarget) -> Option<String> {
+        match target {
+            SendTarget::Chat { chat_id } if self.has_chat_guid(chat_id) => Some(chat_id.clone()),
+            SendTarget::Chat { .. } => None,
+            SendTarget::Handle { .. } => {
+                let guids = self.distinct_chat_guids();
+                (guids.len() == 1).then(|| guids[0].to_string())
+            }
+        }
     }
 
     fn matches_target(&self, target: &SendTarget) -> bool {
@@ -374,6 +459,7 @@ mod tests {
             ResolveAttempt::Unique(row) => {
                 assert_eq!(row.rowid, 102);
                 assert_eq!(row.guid, "api-guid");
+                assert_eq!(row.chat_id.as_deref(), Some("chat-1"));
             }
             other => panic!("expected unique resolver match, got {other:?}"),
         }
@@ -423,8 +509,34 @@ mod tests {
             ResolveAttempt::Unique(row) => {
                 assert_eq!(row.rowid, 102);
                 assert_eq!(row.guid, "chat-guid");
+                assert_eq!(row.chat_id.as_deref(), Some("chat-target"));
             }
             other => panic!("expected unique resolver match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolver_leaves_ambiguous_handle_chat_unset() {
+        let rows = vec![candidate(
+            101,
+            "provider-guid",
+            "body",
+            "+15550000001",
+            "chat-1,chat-2",
+        )];
+        let outcome = select_candidate(
+            &rows,
+            "body",
+            &SendTarget::Handle {
+                to: "+15550000001".to_string(),
+            },
+            false,
+        )
+        .unwrap();
+
+        match outcome {
+            ResolveAttempt::Unique(row) => assert!(row.chat_id.is_none()),
+            other => panic!("expected a provider binding with no chat, got {other:?}"),
         }
     }
 }
