@@ -11,6 +11,7 @@ permissions:
 jobs:
   source:
     runs-on: macos-14
+    environment: Release
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,7 +26,90 @@ jobs:
           mkdir -p dist
           git archive --format=tar --prefix="blueski-${VERSION}/" "$GITHUB_REF_NAME" | gzip -n > "dist/blueski-${VERSION}.tar.gz"
           shasum -a 256 "dist/blueski-${VERSION}.tar.gz" > "dist/blueski-${VERSION}.tar.gz.sha256"
+      - name: Import Developer ID certificate
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/blueski-signing.keychain-db"
+          P12_PATH="$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          printf '%s' "$DEVELOPER_ID_P12_BASE64" | base64 --decode > "$P12_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$P12_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$DEVELOPER_ID_P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -t cert \
+            -f pkcs12
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+      - name: Build signed app
+        run: |
+          SIGN_ID="Developer ID Application: Kevin Loo (5CW397PZMC)" \
+            scripts/bundle.sh release
+      - name: Verify Developer ID signature
+        run: |
+          codesign --verify --deep --strict --verbose=2 dist/Blueski.app
+          codesign -dv --verbose=4 dist/Blueski.app 2>&1 \
+            | grep -F "Authority=Developer ID Application: Kevin Loo (5CW397PZMC)"
+      - name: Notarize app
+        env:
+          NOTARY_API_KEY_P8_BASE64: ${{ secrets.NOTARY_API_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ vars.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ vars.NOTARY_ISSUER_ID }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTARY_KEY_PATH="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          NOTARY_ZIP="$RUNNER_TEMP/Blueski-${VERSION}-macOS.zip"
+
+          printf '%s' "$NOTARY_API_KEY_P8_BASE64" | base64 --decode > "$NOTARY_KEY_PATH"
+          ditto -c -k --keepParent dist/Blueski.app "$NOTARY_ZIP"
+          xcrun notarytool submit "$NOTARY_ZIP" \
+            --key "$NOTARY_KEY_PATH" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait
+      - name: Staple and validate app
+        run: |
+          xcrun stapler staple dist/Blueski.app
+          codesign --verify --deep --strict --verbose=2 dist/Blueski.app
+          spctl -a -vv -t exec dist/Blueski.app
+          xcrun stapler validate dist/Blueski.app
+      - name: Package notarized app
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ASSET_NAME="Blueski-${VERSION}-macOS.zip"
+
+          rm -f "dist/$ASSET_NAME" "dist/$ASSET_NAME.sha256"
+          ditto -c -k --keepParent dist/Blueski.app "dist/$ASSET_NAME"
+          (cd dist && shasum -a 256 "$ASSET_NAME" > "$ASSET_NAME.sha256")
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/blueski-${VERSION}.tar.gz" \
+            "dist/blueski-${VERSION}.tar.gz.sha256" \
+            "dist/Blueski-${VERSION}-macOS.zip" \
+            "dist/Blueski-${VERSION}-macOS.zip.sha256" \
+            --generate-notes \
+            --verify-tag
+      - name: Delete signing credentials
+        if: ${{ always() }}
+        run: |
+          security delete-keychain "$RUNNER_TEMP/blueski-signing.keychain-db" 2>/dev/null || true
+          rm -f \
+            "$RUNNER_TEMP/developer-id.p12" \
+            "$RUNNER_TEMP"/AuthKey_*.p8 \
+            "$RUNNER_TEMP"/Blueski-*-macOS.zip
