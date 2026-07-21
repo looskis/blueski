@@ -1,0 +1,891 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "BlueSki API",
+    "version": "0.2.0",
+    "description": "Installation-scoped API for sending and receiving Messages.app messages. BlueSki binds to loopback by default. When `api_token` is configured (including by `blueski publish`), every endpoint requires bearer authentication. Webhook delivery is best effort; consumers should recover gaps from the durable event journal.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8788",
+      "description": "Default loopback server"
+    },
+    {
+      "url": "https://{hostname}",
+      "description": "Installation-specific URL created by `blueski publish`",
+      "variables": {
+        "hostname": {
+          "default": "blueski.example.com"
+        }
+      }
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    },
+    {}
+  ],
+  "tags": [
+    {
+      "name": "Messaging",
+      "description": "Queue messages and inspect their durable lifecycle."
+    },
+    {
+      "name": "Events",
+      "description": "Replay or follow the installation-local event journal."
+    },
+    {
+      "name": "Operations",
+      "description": "Inspect the API contract and daemon readiness."
+    },
+    {
+      "name": "Diagnostics",
+      "description": "Unstable endpoints for local compatibility troubleshooting."
+    }
+  ],
+  "paths": {
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenApiDocument",
+        "summary": "Get this OpenAPI document",
+        "tags": [
+          "Operations"
+        ],
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.1 document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Get immediate daemon liveness and identity",
+        "description": "This endpoint is side-effect free and does not perform live permission probes.",
+        "tags": [
+          "Operations"
+        ],
+        "responses": {
+          "200": {
+            "description": "The daemon is running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "operationId": "getStatus",
+        "summary": "Get cached daemon, permission, and webhook status",
+        "tags": [
+          "Operations"
+        ],
+        "responses": {
+          "200": {
+            "description": "Current daemon status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/messages": {
+      "get": {
+        "operationId": "listMessages",
+        "summary": "List the latest journal entry for each message",
+        "description": "Returns compact message state ordered by ascending event cursor. Use the message detail endpoint for the complete lifecycle.",
+        "tags": [
+          "Messaging"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Since"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of messages. Values above 1000 are capped at 1000.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Latest message states",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/JournaledEvent"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "sendMessage",
+        "summary": "Queue an outbound message",
+        "description": "Use exactly one of `to` or `chat_id`. The complete command and its `message.queued` event are committed before the server returns 202. A non-null `client_ref` is an installation-scoped idempotency key; replaying identical content returns the original message, while changing the target, protocol, or text returns 409.",
+        "tags": [
+          "Messaging"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              },
+              "examples": {
+                "handle": {
+                  "summary": "Send to an iMessage phone number",
+                  "value": {
+                    "to": "+14155551234",
+                    "text": "Hello from BlueSki",
+                    "protocol": "imessage",
+                    "client_ref": "550e8400-e29b-41d4-a716-446655440000"
+                  }
+                },
+                "conversation": {
+                  "summary": "Reply to an existing direct or group chat",
+                  "value": {
+                    "chat_id": "iMessage;-;chat-guid",
+                    "text": "Replying in the existing conversation",
+                    "protocol": "imessage",
+                    "client_ref": "87acdac8-368a-456c-9f01-c26fc4fa824f"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "The durable send command was accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "The `client_ref` is already bound to different request content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdempotencyConflict"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/messages/{id}": {
+      "get": {
+        "operationId": "getMessage",
+        "summary": "Get the complete lifecycle of one message",
+        "tags": [
+          "Messaging"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "BlueSki message ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The message lifecycle in ascending event order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageLifecycle"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/events": {
+      "get": {
+        "operationId": "listEvents",
+        "summary": "Replay the durable event journal",
+        "description": "Returns events with an installation-local cursor greater than `since`, ordered ascending. Consumers should persist the last cursor and deduplicate by `(installation_id, id)`.",
+        "tags": [
+          "Events"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Since"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of events. When omitted, all currently available events after the cursor are returned.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Journaled events",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/JournaledEvent"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/events/stream": {
+      "get": {
+        "operationId": "streamEvents",
+        "summary": "Replay and follow the durable event journal",
+        "description": "Streams newline-delimited `JournaledEvent` objects. It first replays events after `since`, then follows live events and repairs subscriber lag from the journal.",
+        "tags": [
+          "Events"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Since"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "An unbounded NDJSON event stream",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                },
+                "x-item-schema": {
+                  "$ref": "#/components/schemas/JournaledEvent"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/debug/chatdb": {
+      "get": {
+        "operationId": "inspectMessagesDatabase",
+        "summary": "Inspect Messages database compatibility",
+        "description": "Diagnostic endpoint whose fields may vary with the local Messages database schema. It is not part of the stable messaging contract.",
+        "tags": [
+          "Diagnostics"
+        ],
+        "responses": {
+          "200": {
+            "description": "Diagnostic information or an embedded error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    }
+  },
+  "webhooks": {
+    "messageEvent": {
+      "post": {
+        "operationId": "receiveBlueSkiEvent",
+        "summary": "Receive a journaled message event from BlueSki",
+        "description": "BlueSki POSTs the exact journaled JSON body after committing it locally. `X-Blueski-Signature` is lowercase hexadecimal HMAC-SHA256 over the exact raw request body using the destination secret. There is no timestamp header. Delivery succeeds on any 2xx response and otherwise receives up to three total attempts, with 200 ms and 400 ms delays. Recover missing events from `/events`.",
+        "parameters": [
+          {
+            "name": "X-Blueski-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "description": "Hex HMAC-SHA256 of the exact raw body"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JournaledEvent"
+              },
+              "examples": {
+                "received": {
+                  "summary": "Inbound iMessage",
+                  "value": {
+                    "installation_id": "bsinst_0123456789abcdef0123456789abcdef",
+                    "id": 1842,
+                    "event": "message.received",
+                    "message_id": "Apple-provider-message-guid",
+                    "provider_message_id": "Apple-provider-message-guid",
+                    "handle": "person@example.com",
+                    "chat_id": "iMessage;-;chat-guid",
+                    "text": "Hello",
+                    "protocol": "imessage",
+                    "status": "received",
+                    "timestamp": "2026-07-20T19:14:32Z",
+                    "created_at": "2026-07-20T19:14:33Z"
+                  }
+                },
+                "delivered": {
+                  "summary": "Outbound delivery update",
+                  "value": {
+                    "installation_id": "bsinst_0123456789abcdef0123456789abcdef",
+                    "id": 1846,
+                    "event": "message.status",
+                    "message_id": "8ceef646-d705-4608-ad78-b1b581d61f4e",
+                    "provider_message_id": "Apple-provider-message-guid",
+                    "client_ref": "550e8400-e29b-41d4-a716-446655440000",
+                    "handle": "+14155551234",
+                    "chat_id": "iMessage;-;chat-guid",
+                    "protocol": "imessage",
+                    "status": "delivered",
+                    "timestamp": "2026-07-20T19:14:40Z",
+                    "created_at": "2026-07-20T19:14:41Z"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Event accepted; BlueSki will not retry this delivery"
+          },
+          "default": {
+            "description": "The event was not accepted and BlueSki may retry it"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Installation-specific token generated by `blueski publish` or set as `api_token`. Authentication is disabled when the daemon has no configured token."
+      }
+    },
+    "parameters": {
+      "Since": {
+        "name": "since",
+        "in": "query",
+        "description": "Return entries with an installation-local cursor strictly greater than this value.",
+        "schema": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid request",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "A bearer token is configured and the request did not provide the exact token",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": "missing or invalid bearer token"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "The requested message does not exist",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": "message not found"
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "Internal storage or processing failure",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "SendMessageRequest": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "to": {
+            "type": "string",
+            "description": "Recipient handle: an E.164-style phone number or iMessage email address.",
+            "examples": [
+              "+14155551234",
+              "person@example.com"
+            ]
+          },
+          "chat_id": {
+            "type": "string",
+            "description": "Messages `chat.guid` from a prior event. Supports direct and group conversations."
+          },
+          "text": {
+            "type": "string",
+            "description": "Plain-text message body. BlueSki does not currently support attachments or structured message formatting."
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/Protocol"
+          },
+          "client_ref": {
+            "type": "string",
+            "description": "Optional installation-scoped idempotency and correlation key. This value is carried on outbound lifecycle events."
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "to": {},
+              "chat_id": false
+            },
+            "required": [
+              "to"
+            ]
+          },
+          {
+            "properties": {
+              "to": false,
+              "chat_id": {}
+            },
+            "required": [
+              "chat_id"
+            ]
+          }
+        ]
+      },
+      "AcceptedMessage": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "status",
+          "idempotent"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "description": "The current durable status. An idempotent replay can return a later status than queued."
+          },
+          "idempotent": {
+            "type": "boolean",
+            "description": "True when a non-null `client_ref` placed the request in the idempotency namespace."
+          }
+        }
+      },
+      "MessageLifecycle": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "events"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JournaledEvent"
+            }
+          }
+        }
+      },
+      "JournaledEvent": {
+        "type": "object",
+        "required": [
+          "installation_id",
+          "id",
+          "event",
+          "message_id",
+          "timestamp",
+          "created_at"
+        ],
+        "properties": {
+          "installation_id": {
+            "type": "string",
+            "description": "Stable identity of the BlueSki node. Combine this with `id` to deduplicate webhook delivery."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonic installation-local event cursor. It is not globally unique."
+          },
+          "event": {
+            "$ref": "#/components/schemas/EventType"
+          },
+          "message_id": {
+            "type": "string",
+            "description": "BlueSki message identity. Outbound messages use the UUID returned by `POST /messages`; inbound messages currently use the Apple message GUID."
+          },
+          "provider_message_id": {
+            "type": "string",
+            "description": "Apple Messages message GUID, when known."
+          },
+          "client_ref": {
+            "type": "string",
+            "description": "Caller-provided outbound idempotency and correlation key."
+          },
+          "handle": {
+            "type": "string",
+            "description": "Phone number or email handle. Inbound values come from Messages and are not guaranteed to be normalized."
+          },
+          "chat_id": {
+            "type": "string",
+            "description": "Messages `chat.guid` for the direct or group conversation."
+          },
+          "text": {
+            "type": "string",
+            "description": "Plain-text message body when relevant to the event."
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/Protocol"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MessageStatus"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Human-readable transport or reconciliation failure reason. This is not currently a stable machine-readable error code."
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Provider event time when available, otherwise the BlueSki observation time."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Time the event was committed to the BlueSki journal."
+          }
+        }
+      },
+      "EventType": {
+        "type": "string",
+        "enum": [
+          "message.queued",
+          "message.sent",
+          "message.failed",
+          "message.received",
+          "message.status"
+        ]
+      },
+      "MessageStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "received",
+          "sent",
+          "delivered",
+          "read",
+          "unknown"
+        ]
+      },
+      "Protocol": {
+        "type": "string",
+        "enum": [
+          "imessage",
+          "sms",
+          "rcs"
+        ],
+        "default": "imessage",
+        "description": "Messages transport. Existing chat targets use the conversation's service."
+      },
+      "Health": {
+        "type": "object",
+        "required": [
+          "status",
+          "product",
+          "version",
+          "installation_id",
+          "port",
+          "authentication_required"
+        ],
+        "properties": {
+          "status": {
+            "const": "ok"
+          },
+          "product": {
+            "const": "blueski"
+          },
+          "version": {
+            "type": "string"
+          },
+          "installation_id": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "authentication_required": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Status": {
+        "type": "object",
+        "required": [
+          "status",
+          "product",
+          "version",
+          "installation_id",
+          "transport",
+          "uptime_secs",
+          "port",
+          "webhook_configured",
+          "webhook_count",
+          "webhooks",
+          "permissions"
+        ],
+        "properties": {
+          "status": {
+            "const": "ok"
+          },
+          "product": {
+            "const": "blueski"
+          },
+          "version": {
+            "type": "string"
+          },
+          "installation_id": {
+            "type": "string"
+          },
+          "transport": {
+            "const": "applescript"
+          },
+          "uptime_secs": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "webhook_configured": {
+            "type": "boolean"
+          },
+          "webhook_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 16
+          },
+          "webhooks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebhookStatus"
+            }
+          },
+          "permissions": {
+            "$ref": "#/components/schemas/PermissionStatus"
+          }
+        }
+      },
+      "WebhookStatus": {
+        "type": "object",
+        "required": [
+          "id",
+          "enabled"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "last_success_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Safe error category; webhook URL, secret, and signature are never returned."
+          }
+        }
+      },
+      "PermissionStatus": {
+        "type": "object",
+        "required": [
+          "checked",
+          "full_disk_access",
+          "automation"
+        ],
+        "properties": {
+          "checked": {
+            "type": "boolean"
+          },
+          "full_disk_access": {
+            "type": "boolean"
+          },
+          "automation": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "IdempotencyConflict": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Error"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "client_ref": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
