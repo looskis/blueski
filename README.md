@@ -99,6 +99,11 @@ request. `blueski unpublish` removes the tunnel and disables the token.
 
 ### HTTP API
 
+The canonical OpenAPI 3.1 contract is checked in as [`openapi.json`](openapi.json)
+and served by every running node at `GET /openapi.json`. It documents the REST
+endpoints, conditional bearer authentication, schemas, examples, and the signed
+outbound webhook operation.
+
 Send a message:
 
 ```http
@@ -130,6 +135,7 @@ do not enter this namespace: the first request accepted after upgrading to
 
 Other endpoints:
 
+- `GET /openapi.json` — machine-readable OpenAPI 3.1 contract
 - `GET /healthz` — immediate, side-effect-free liveness and product identity
 - `GET /status` — cached daemon and permission state; never invokes AppleScript
 - `GET /messages?since=<cursor>&limit=<n>` — latest journal entry per message

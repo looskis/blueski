@@ -1,5 +1,5 @@
 //! The control socket: a loopback HTTP server. This is the consumer's entire
-//! inbound surface — `POST /messages` and `GET /status`.
+//! inbound surface, including its machine-readable OpenAPI contract.
 
 use crate::config::Config;
 use crate::model::{SendJob, SendRequest, SendTarget};
@@ -25,6 +25,8 @@ use std::time::Instant;
 use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, mpsc};
 
+const OPENAPI_DOCUMENT: &str = include_str!("../openapi.json");
+
 #[derive(Clone)]
 pub struct AppState {
     pub send_tx: mpsc::UnboundedSender<()>,
@@ -47,6 +49,7 @@ struct EventsQuery {
 pub fn router(state: AppState) -> Router {
     let auth_config = state.config.clone();
     Router::new()
+        .route("/openapi.json", get(get_openapi))
         .route("/messages", get(get_messages).post(post_messages))
         .route("/messages/:id", get(get_message))
         .route("/events", get(get_events))
@@ -56,6 +59,13 @@ pub fn router(state: AppState) -> Router {
         .route("/debug/chatdb", get(get_debug_chatdb))
         .layer(middleware::from_fn_with_state(auth_config, require_auth))
         .with_state(state)
+}
+
+async fn get_openapi() -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(OPENAPI_DOCUMENT))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn require_auth(State(config): State<Arc<Config>>, request: Request, next: Next) -> Response {
@@ -615,6 +625,47 @@ mod tests {
             .unwrap()
             .starts_with("bsinst_"));
         assert!(health.get("permissions").is_none());
+    }
+
+    #[tokio::test]
+    async fn openapi_document_matches_the_server_contract() {
+        let store = Store::open(&temp_db_path("openapi-route"), "bsinst_test")
+            .await
+            .unwrap();
+        let response = router(test_state(store).await)
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["openapi"], "3.1.0");
+        assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
+
+        let paths = document["paths"].as_object().unwrap();
+        for path in [
+            "/openapi.json",
+            "/healthz",
+            "/status",
+            "/messages",
+            "/messages/{id}",
+            "/events",
+            "/events/stream",
+            "/debug/chatdb",
+        ] {
+            assert!(paths.contains_key(path), "OpenAPI is missing {path}");
+        }
+        assert!(document["webhooks"].get("messageEvent").is_some());
     }
 
     #[tokio::test]
