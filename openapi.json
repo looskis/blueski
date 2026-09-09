@@ -383,6 +383,180 @@
           }
         }
       }
+    },
+    "/messages/{id}/attachments": {
+      "get": {
+        "summary": "List inbound message attachments and verified conversation scope",
+        "tags": [
+          "Messaging"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Message attachment data; no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid bearer token"
+          },
+          "404": {
+            "description": "Message or attachment not found"
+          },
+          "409": {
+            "description": "Message has ambiguous conversation membership"
+          },
+          "503": {
+            "description": "Attachment unavailable, outside permitted directory, or too large"
+          }
+        }
+      }
+    },
+    "/messages/{id}/attachments/{attachment}": {
+      "get": {
+        "summary": "Download a message-owned attachment (maximum 20 MiB)",
+        "tags": [
+          "Messaging"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachment",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Message attachment data; no-store",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid bearer token"
+          },
+          "404": {
+            "description": "Message or attachment not found"
+          },
+          "409": {
+            "description": "Message has ambiguous conversation membership"
+          },
+          "503": {
+            "description": "Attachment unavailable, outside permitted directory, or too large"
+          }
+        }
+      }
+    },
+    "/settings/default-sender": {
+      "get": {
+        "operationId": "getDefaultSender",
+        "summary": "Read Messages default sender and available addresses using its settings UI",
+        "description": "Requires an interactive macOS session, Accessibility, and Automation access. Opens Messages settings. This is an app-wide default for new conversations, not a per-message sender override.",
+        "responses": {
+          "200": {
+            "description": "Current setting and choices",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DefaultSender"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer token required when configured"
+          },
+          "409": {
+            "description": "Another settings operation is running"
+          },
+          "503": {
+            "description": "Accessibility/Automation unavailable, UI changed, or operation timed out"
+          }
+        }
+      },
+      "post": {
+        "operationId": "setDefaultSender",
+        "summary": "Select an available app-wide sender for new Messages conversations",
+        "description": "Persists the Messages setting and verifies it after selection. Does not send a message or change existing chats. UI automation requires Accessibility/Automation and an interactive session. Concurrent senders share this global setting; callers must not treat this as an atomic select-and-send operation. On timeout, read the setting before retrying.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "address"
+                ],
+                "properties": {
+                  "address": {
+                    "type": "string",
+                    "description": "Available international phone number beginning with +, or email address.",
+                    "example": "+16469921008"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verified selection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DefaultSender"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid address"
+          },
+          "401": {
+            "description": "Bearer token required when configured"
+          },
+          "409": {
+            "description": "Another settings operation is running"
+          },
+          "422": {
+            "description": "Address unavailable/ambiguous, or malformed JSON body"
+          },
+          "503": {
+            "description": "Permissions, UI, or timeout failure; setting may have changed before verification"
+          }
+        }
+      }
     }
   },
   "webhooks": {
@@ -421,6 +595,14 @@
                     "provider_message_id": "Apple-provider-message-guid",
                     "handle": "person@example.com",
                     "chat_id": "iMessage;-;chat-guid",
+                    "thread_kind": "direct",
+                    "participant_count": 1,
+                    "membership_complete": true,
+                    "classification_basis": [
+                      "participant_count:1",
+                      "chat_guid:direct"
+                    ],
+                    "classification_conflict": false,
                     "text": "Hello",
                     "protocol": "imessage",
                     "status": "received",
@@ -659,9 +841,42 @@
             "type": "string",
             "description": "Phone number or email handle. Inbound values come from Messages and are not guaranteed to be normalized."
           },
+          "destination_caller_id": {
+            "type": "string",
+            "description": "Receiving phone number or email address from message.destination_caller_id for inbound events. Raw provider formatting; omitted when unavailable. Never inferred from chat-level routing hints."
+          },
           "chat_id": {
             "type": "string",
             "description": "Messages `chat.guid` for the direct or group conversation."
+          },
+          "thread_kind": {
+            "type": "string",
+            "enum": [
+              "direct",
+              "group",
+              "unclassified"
+            ],
+            "description": "BlueSki's conservative classification of the Messages chat. Present on message.received."
+          },
+          "participant_count": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Distinct normalized remote handles resolved from chat membership. Omitted when membership is unavailable."
+          },
+          "membership_complete": {
+            "type": "boolean",
+            "description": "Whether BlueSki resolved one chat and at least one remote participant while classifying the inbound message."
+          },
+          "classification_basis": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Machine-readable evidence used for thread_kind, such as participant_count:1, room_name, or chat_guid:group."
+          },
+          "classification_conflict": {
+            "type": "boolean",
+            "description": "True when direct and group evidence contradict. In that case thread_kind is unclassified."
           },
           "text": {
             "type": "string",
@@ -766,6 +981,7 @@
           "webhook_configured",
           "webhook_count",
           "webhooks",
+          "inbound_enrichment",
           "permissions"
         ],
         "properties": {
@@ -807,8 +1023,28 @@
               "$ref": "#/components/schemas/WebhookStatus"
             }
           },
+          "inbound_enrichment": {
+            "$ref": "#/components/schemas/InboundEnrichmentStatus"
+          },
           "permissions": {
             "$ref": "#/components/schemas/PermissionStatus"
+          }
+        }
+      },
+      "InboundEnrichmentStatus": {
+        "type": "object",
+        "required": [
+          "pending",
+          "quarantined"
+        ],
+        "properties": {
+          "pending": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "quarantined": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -885,6 +1121,31 @@
             }
           }
         ]
+      },
+      "DefaultSender": {
+        "type": "object",
+        "required": [
+          "selected",
+          "available",
+          "scope"
+        ],
+        "properties": {
+          "selected": {
+            "type": "string"
+          },
+          "available": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "new_conversations"
+            ]
+          }
+        }
       }
     }
   }

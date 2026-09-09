@@ -87,7 +87,19 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_caller_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub membership_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification_basis: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification_conflict: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,7 +119,13 @@ impl Event {
             provider_message_id: None,
             client_ref: None,
             handle: None,
+            destination_caller_id: None,
             chat_id: None,
+            thread_kind: None,
+            participant_count: None,
+            membership_complete: None,
+            classification_basis: None,
+            classification_conflict: None,
             text: None,
             protocol: None,
             status: None,

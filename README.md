@@ -155,22 +155,43 @@ including `installation_id`, its local cursor `id`, `created_at`, optional
 raw JSON bytes. Each enabled destination has a bounded ordered worker, its own
 retry loop, and a distinct secret, so a slow endpoint does not delay another.
 
+Inbound events include optional `destination_caller_id`, copied directly from
+Messages `message.destination_caller_id`: the local phone number or email
+address that received the message. Formatting is preserved, and missing/blank
+values are omitted rather than inferred from chat routing hints. Consumers
+can filter this field to subscribe to a particular receiving address. Older
+journal entries are unchanged and may lack it.
+
+Each inbound provider message produces one actionable `message.received`
+event, after BlueSki has attempted chat classification. The event includes
+`thread_kind`, nullable `participant_count`, `membership_complete`,
+`classification_basis`, and `classification_conflict`. BlueSki never emits a
+pre-classification inbound webhook followed by a second actionable copy.
+Membership that cannot be resolved safely is published as `unclassified`;
+contradictory direct/group evidence is also `unclassified` with
+`classification_conflict=true`.
+
 Lifecycle semantics:
 
 - `message.sent` means Messages.app accepted the AppleScript send.
 - `message.status` with `status=sent` means BlueSki resolved and durably bound
   the Apple message GUID and Messages chat GUID.
 - Later `message.status` events report `delivered` and `read`.
-- `status=unknown` means BlueSki restarted or reconciliation failed inside the
-  unavoidable AppleScript uncertainty window; it will not blindly resend and
-  risk a duplicate.
+- If AppleScript succeeds before BlueSki can bind the provider row, the send
+  remains `sent_unbound` and reconciliation retries every 30 seconds. BlueSki
+  never blindly resends and never turns a delayed binding into terminal loss.
 
-Inbound events are journaled at least once before the Messages receive
-watermark advances. Journal entries are replayable by cursor. Webhook delivery
-is best effort; consumers recover gaps through `/events?since=<cursor>` and
-deduplicate deliveries by `(installation_id, event.id)`. If a crash causes the
-same inbound provider message to be journaled again, deduplicate its semantic
-processing by `(installation_id, provider_message_id, event kind/status)`.
+Inbound rows are durably captured before the Messages receive watermark
+advances. Rows missing their handle, chat GUID, or body stay in the enrichment
+queue and are not published as `message.received`. The receive worker re-reads
+them until complete, quarantines and surfaces overdue rows in `/status`, and
+survives daemon restarts without advancing past them silently. Historical
+incomplete events from older versions are not replayed automatically. Journal
+entries are replayable by cursor. Webhook delivery is best effort; consumers
+recover gaps through `/events?since=<cursor>` and deduplicate deliveries by
+`(installation_id, event.id)`. If a crash causes the same inbound provider
+message to be journaled again, deduplicate its semantic processing by
+`(installation_id, provider_message_id, event kind/status)`.
 
 ## Configuration and state
 
@@ -245,3 +266,37 @@ the [official tap guide](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap).
 ## License
 
 MIT
+
+### Inbound attachments
+
+`GET /messages/{provider_message_id}/attachments` returns inbound message scope (`message_id`, `chat_id`, `destination`, `peer`, `protocol`) and up to nine attachment descriptors (`id`, `mime_type`, `bytes`). `GET /messages/{provider_message_id}/attachments/{id}` downloads only an attachment joined to that inbound message. Both use the existing API authentication policy and `Cache-Control: no-store`. No filesystem paths are exposed or accepted. Downloads are restricted to canonical paths under Messages' Attachments directory, regular files, and 20 MiB. Missing, not-yet-downloaded, oversized, or inaccessible files return a generic error. Consumers must enforce their own receiving-address/thread policy before requesting attachments. Photo-only inbound messages are journaled with `[Attachment]` when there is no decodable text.
+
+## Default sender for new conversations
+
+`blueski default-sender` opens Messages → Settings → iMessage and returns the
+current selection plus available phone/email addresses. To change it:
+
+```sh
+blueski default-sender +16469921008
+```
+
+The equivalent daemon API is `GET /settings/default-sender` and
+`POST /settings/default-sender` with `{"address":"+16469921008"}`. It uses the
+same bearer authentication as other endpoints. Success returns
+`{"selected":"+16469921008","available":["+16469921008"],"scope":"new_conversations"}`
+(the actual list contains all available addresses).
+
+This uses AppleScript UI automation. Enable **Accessibility** for Blueski in
+System Settings → Privacy & Security, and allow its Automation access to
+Messages and System Events. A logged-in interactive session is required.
+The implementation targets the English Messages settings UI inspected on this
+Mac; UI changes/localization can cause a clear error instead of a selection.
+It selects only an exact normalized available address and verifies the result.
+No messages are sent by this command.
+
+This setting is persistent and shared by all applications using Messages.
+It controls new conversations; replies to existing chats keep their routing.
+It is not a per-message `from` guarantee, and changing it then sending is not
+an atomic operation. Avoid switching it around concurrent sends. A timeout
+can occur after a selection changes: read the current value before retrying.
+No signing, Full Disk Access, or receiving-address configuration is changed.

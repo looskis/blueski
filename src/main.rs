@@ -1,8 +1,10 @@
 //! Blueski — a single-process macOS LaunchAgent that turns a Mac into
 //! an iMessage send/receive node. See README.md for the spec.
 
+mod attachments;
 mod config;
 mod debug;
+mod default_sender;
 mod launchd;
 mod model;
 mod permissions;
@@ -64,6 +66,11 @@ enum Command {
         #[arg(long)]
         follow: bool,
     },
+    /// Read or set Messages' app-wide default address for new conversations.
+    DefaultSender {
+        /// Available phone (+country code) or email; omit to list current choices.
+        address: Option<String>,
+    },
     /// Ask the OS supervisor to bring the daemon online and report status.
     Up,
     /// Stop and unload the active OS-supervised daemon.
@@ -110,6 +117,7 @@ fn main() -> Result<()> {
             limit,
             follow,
         } => events(since, limit, follow),
+        Command::DefaultSender { address } => default_sender_command(address),
         Command::Up => up(),
         Command::Down => down(),
         Command::Status => status(),
@@ -680,6 +688,36 @@ fn print_status(body: &str) {
         ),
         Err(_) => println!("{body}"),
     }
+}
+
+fn default_sender_command(address: Option<String>) -> Result<()> {
+    let config = Config::load_or_init()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(25))
+            .build()?;
+        let url = format!("http://127.0.0.1:{}/settings/default-sender", config.port);
+        let mut request = match address {
+            Some(address) => client
+                .post(url)
+                .json(&serde_json::json!({ "address": address })),
+            None => client.get(url),
+        };
+        if let Some(token) = config.api_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("default sender request failed ({status}): {body}");
+        }
+        println!("{body}");
+        Ok(())
+    })
 }
 
 #[cfg(test)]

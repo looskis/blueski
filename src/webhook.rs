@@ -381,6 +381,25 @@ mod tests {
             .unwrap()
     }
 
+    fn received_event(message_id: &str) -> Event {
+        let mut event = Event::new("message.received", message_id.to_string());
+        event.provider_message_id = Some(message_id.to_string());
+        event.handle = Some("+15550000001".to_string());
+        event.chat_id = Some("any;-;+15550000001".to_string());
+        event.thread_kind = Some("direct".to_string());
+        event.participant_count = Some(1);
+        event.membership_complete = Some(true);
+        event.classification_basis = Some(vec![
+            "participant_count:1".to_string(),
+            "chat_guid:direct".to_string(),
+        ]);
+        event.classification_conflict = Some(false);
+        event.text = Some("hello".to_string());
+        event.protocol = Some("imessage".to_string());
+        event.status = Some("received".to_string());
+        event
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn webhook_signs_the_exact_journaled_envelope() {
         let (capture_tx, mut capture_rx) = mpsc::channel(1);
@@ -408,10 +427,9 @@ mod tests {
             store,
             events,
         );
-        let mut event = Event::new("message.received", "apple-guid".to_string());
-        event.provider_message_id = Some("apple-guid".to_string());
+        let mut event = received_event("apple-guid");
         event.chat_id = Some("iMessage;-;chat-1".to_string());
-        event.status = Some("received".to_string());
+        event.destination_caller_id = Some("+16469921008".to_string());
 
         let saved = tokio::task::spawn_blocking(move || sink.emit_blocking(event))
             .await
@@ -427,7 +445,25 @@ mod tests {
         assert_eq!(delivered.installation_id, "bsinst_test");
         assert_eq!(delivered.created_at, saved.created_at);
         assert_eq!(delivered.chat_id, saved.chat_id);
+        assert_eq!(
+            delivered.destination_caller_id.as_deref(),
+            Some("+16469921008")
+        );
         assert_eq!(delivered.provider_message_id, saved.provider_message_id);
+        assert_eq!(delivered.thread_kind.as_deref(), Some("direct"));
+        assert_eq!(delivered.participant_count, Some(1));
+        assert_eq!(delivered.membership_complete, Some(true));
+        assert_eq!(
+            delivered.classification_basis.as_deref(),
+            Some(
+                [
+                    "participant_count:1".to_string(),
+                    "chat_guid:direct".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(delivered.classification_conflict, Some(false));
         assert_eq!(
             headers.get(SIGNATURE_HEADER).unwrap().to_str().unwrap(),
             sign("webhook-secret", &body)
@@ -492,16 +528,8 @@ mod tests {
         );
 
         let started = tokio::time::Instant::now();
-        let first = emit(
-            sink.clone(),
-            Event::new("message.received", "first".to_string()),
-        )
-        .await;
-        let second = emit(
-            sink.clone(),
-            Event::new("message.received", "second".to_string()),
-        )
-        .await;
+        let first = emit(sink.clone(), received_event("first")).await;
+        let second = emit(sink.clone(), received_event("second")).await;
 
         let fast_first = tokio::time::timeout(Duration::from_millis(400), fast_rx.recv())
             .await
@@ -603,11 +631,7 @@ mod tests {
         );
 
         let started = tokio::time::Instant::now();
-        emit(
-            sink,
-            Event::new("message.received", "timeout-isolation".to_string()),
-        )
-        .await;
+        emit(sink, received_event("timeout-isolation")).await;
         tokio::time::timeout(Duration::from_millis(300), fast_rx.recv())
             .await
             .expect("timing out destination delayed fast destination")
@@ -648,11 +672,7 @@ mod tests {
             store,
             events,
         );
-        emit(
-            sink.clone(),
-            Event::new("message.received", "ignored".to_string()),
-        )
-        .await;
+        emit(sink.clone(), received_event("ignored")).await;
 
         assert!(
             tokio::time::timeout(Duration::from_millis(250), capture_rx.recv())

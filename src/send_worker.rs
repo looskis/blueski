@@ -17,10 +17,11 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 const RESOLVE_ATTEMPTS: u32 = 32;
 const RESOLVE_INTERVAL: Duration = Duration::from_millis(250);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub async fn run<S: Sender>(
     mut wake_rx: mpsc::UnboundedReceiver<()>,
@@ -57,8 +58,15 @@ pub async fn run<S: Sender>(
             }
         }
 
-        if wake_rx.recv().await.is_none() {
-            break;
+        match timeout(RECONCILE_INTERVAL, wake_rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => break,
+            Err(_) => {
+                if let Err(error) = recover_inflight(&store_conn, &sink, &chatdb, &max_rowid).await
+                {
+                    tracing::warn!(%error, "failed to retry unbound sends");
+                }
+            }
         }
     }
 }
@@ -180,20 +188,17 @@ async fn resolve_and_finish(
             }
         }
         Ok(None) => {
-            let reason = "send outcome could not be reconciled without risking a duplicate";
-            tracing::warn!(message_id = %job.message_id, "{reason}");
-            match store::record_unknown(conn, &job, reason).await {
-                Ok(event) => sink.publish_committed(event),
-                Err(error) => tracing::warn!(%error, "failed to record unknown send outcome"),
-            }
+            tracing::warn!(
+                message_id = %job.message_id,
+                "send remains unbound; reconciliation will retry"
+            );
         }
         Err(error) => {
-            let reason = format!("chat.db reconciliation failed: {error}");
-            tracing::warn!(message_id = %job.message_id, %reason);
-            match store::record_unknown(conn, &job, &reason).await {
-                Ok(event) => sink.publish_committed(event),
-                Err(error) => tracing::warn!(%error, "failed to record unknown send outcome"),
-            }
+            tracing::warn!(
+                message_id = %job.message_id,
+                %error,
+                "send reconciliation failed; reconciliation will retry"
+            );
         }
     }
 }
@@ -308,32 +313,44 @@ fn select_candidate(
         return Ok(ResolveAttempt::Pending);
     }
 
-    let text_matches = rows
-        .iter()
-        .filter(|row| row.message_text().as_deref() == Some(text))
-        .collect::<Vec<_>>();
-    let strong = text_matches
+    let target_matches = rows
         .iter()
         .filter(|row| row.matches_target(target))
         .collect::<Vec<_>>();
-
-    if strong.len() == 1 {
-        let row = strong[0];
+    if target_matches.len() == 1 {
+        let row = target_matches[0];
         return Ok(ResolveAttempt::Unique(ResolvedRow {
             rowid: row.rowid,
             guid: row.guid.clone(),
             chat_id: row.resolved_chat_id(target),
         }));
     }
-    if strong.len() > 1 {
+
+    let target_and_text_matches = target_matches
+        .iter()
+        .filter(|row| row.message_text().as_deref() == Some(text))
+        .collect::<Vec<_>>();
+    if target_and_text_matches.len() == 1 {
+        let row = target_and_text_matches[0];
+        return Ok(ResolveAttempt::Unique(ResolvedRow {
+            rowid: row.rowid,
+            guid: row.guid.clone(),
+            chat_id: row.resolved_chat_id(target),
+        }));
+    }
+    if target_and_text_matches.len() > 1 {
         return Ok(ResolveAttempt::Ambiguous {
-            matches: strong.len(),
+            matches: target_and_text_matches.len(),
         });
     }
 
-    // Some macOS builds populate chat joins after the message row. If no handle
-    // evidence arrives, only fall back when the entire post-watermark window has
-    // exactly one outbound row and its decoded body matches.
+    let text_matches = rows
+        .iter()
+        .filter(|row| row.message_text().as_deref() == Some(text))
+        .collect::<Vec<_>>();
+
+    // Some macOS builds populate chat joins after the message row. Text is only
+    // a final disambiguator, never the primary provider identity.
     if allow_single_row_fallback && rows.len() == 1 && text_matches.len() == 1 {
         let row = text_matches[0];
         return Ok(ResolveAttempt::Unique(ResolvedRow {
@@ -462,6 +479,36 @@ mod tests {
                 assert_eq!(row.chat_id.as_deref(), Some("chat-1"));
             }
             other => panic!("expected unique resolver match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolver_uses_a_unique_target_when_apple_text_is_unavailable() {
+        let rows = vec![CandidateRow {
+            rowid: 610260,
+            guid: "provider-guid".to_string(),
+            text: None,
+            body: None,
+            handles_csv: Some("+15550000001".to_string()),
+            chat_guids_csv: Some("any;-;+15550000001".to_string()),
+        }];
+
+        let outcome = select_candidate(
+            &rows,
+            &"long body".repeat(100),
+            &SendTarget::Handle {
+                to: "+15550000001".to_string(),
+            },
+            false,
+        )
+        .unwrap();
+
+        match outcome {
+            ResolveAttempt::Unique(row) => {
+                assert_eq!(row.rowid, 610260);
+                assert_eq!(row.guid, "provider-guid");
+            }
+            other => panic!("expected target-only correlation, got {other:?}"),
         }
     }
 

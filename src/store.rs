@@ -82,7 +82,19 @@ pub struct JournaledEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_caller_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub membership_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification_basis: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification_conflict: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +105,16 @@ pub struct JournaledEvent {
     pub reason: Option<String>,
     pub timestamp: String,
     pub created_at: String,
+}
+
+#[derive(Default, Deserialize)]
+struct EventClassification {
+    destination_caller_id: Option<String>,
+    thread_kind: Option<String>,
+    participant_count: Option<u32>,
+    membership_complete: Option<bool>,
+    classification_basis: Option<Vec<String>>,
+    classification_conflict: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -159,6 +181,15 @@ impl Store {
         ensure_column(&conn, "events", "provider_message_id", "TEXT").await?;
         ensure_column(&conn, "events", "chat_id", "TEXT").await?;
         ensure_column(&conn, "events", "installation_id", "TEXT").await?;
+        conn.execute(
+            "UPDATE outbound
+             SET dispatch_state = 'sent_unbound', last_status = 'sent'
+             WHERE dispatch_state = 'unknown'
+               AND guid IS NULL
+               AND text IS NOT NULL",
+            (),
+        )
+        .await?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS outbound_idempotency (
                  client_ref TEXT PRIMARY KEY,
@@ -240,6 +271,7 @@ async fn ensure_column(
 
 /// Persist an emitted event and return the journaled shape consumers read.
 pub async fn record_event(conn: &Connection, event: &Event) -> Result<JournaledEvent> {
+    validate_public_event(event)?;
     let installation_id = installation_id(conn).await?;
     let payload_json = serde_json::to_string(event)?;
     let created_at = now_iso();
@@ -268,22 +300,44 @@ pub async fn record_event(conn: &Connection, event: &Event) -> Result<JournaledE
     .await?;
 
     let id = last_insert_rowid(conn).await?;
-    Ok(JournaledEvent {
-        installation_id,
-        id,
-        event: event.event.clone(),
-        message_id: event.message_id.clone(),
-        provider_message_id: event.provider_message_id.clone(),
-        client_ref: event.client_ref.clone(),
-        handle: event.handle.clone(),
-        chat_id: event.chat_id.clone(),
-        text: event.text.clone(),
-        protocol: event.protocol.clone(),
-        status: event.status.clone(),
-        reason: event.reason.clone(),
-        timestamp: event.timestamp.clone(),
-        created_at,
-    })
+    Ok(journaled_event(installation_id, id, event, created_at))
+}
+
+fn validate_public_event(event: &Event) -> Result<()> {
+    if event.event != "message.received" {
+        return Ok(());
+    }
+    let complete = event
+        .provider_message_id
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        && event
+            .handle
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && event
+            .chat_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && event
+            .thread_kind
+            .as_deref()
+            .is_some_and(|value| matches!(value, "direct" | "group" | "unclassified"))
+        && event.membership_complete.is_some()
+        && event.classification_basis.is_some()
+        && event.classification_conflict.is_some()
+        && event
+            .text
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && event
+            .protocol
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    if !complete {
+        anyhow::bail!("message.received is missing required provider fields");
+    }
+    Ok(())
 }
 
 /// Return persisted events after `since`, ordered by cursor ascending.
@@ -295,12 +349,12 @@ pub async fn list_events_since(
     let sql = match limit {
         Some(_) => {
             "SELECT installation_id, id, event, message_id, provider_message_id, client_ref, handle,
-                    chat_id, text, protocol, status, reason, timestamp, created_at
+                    chat_id, text, protocol, status, reason, timestamp, created_at, payload_json
              FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2"
         }
         None => {
             "SELECT installation_id, id, event, message_id, provider_message_id, client_ref, handle,
-                    chat_id, text, protocol, status, reason, timestamp, created_at
+                    chat_id, text, protocol, status, reason, timestamp, created_at, payload_json
              FROM events WHERE id > ?1 ORDER BY id ASC"
         }
     };
@@ -311,22 +365,7 @@ pub async fn list_events_since(
     };
     let mut events = Vec::new();
     while let Some(row) = rows.next().await? {
-        events.push(JournaledEvent {
-            installation_id: row.get(0)?,
-            id: row.get(1)?,
-            event: row.get(2)?,
-            message_id: row.get(3)?,
-            provider_message_id: row.get(4)?,
-            client_ref: row.get(5)?,
-            handle: row.get(6)?,
-            chat_id: row.get(7)?,
-            text: row.get(8)?,
-            protocol: row.get(9)?,
-            status: row.get(10)?,
-            reason: row.get(11)?,
-            timestamp: row.get(12)?,
-            created_at: row.get(13)?,
-        });
+        events.push(journaled_event_from_row(&row)?);
     }
     Ok(events)
 }
@@ -344,7 +383,7 @@ pub async fn list_messages(
         .query(
             "SELECT e.installation_id, e.id, e.event, e.message_id, e.provider_message_id, e.client_ref,
                     e.handle, e.chat_id, e.text, e.protocol, e.status, e.reason,
-                    e.timestamp, e.created_at
+                    e.timestamp, e.created_at, e.payload_json
              FROM events e
              JOIN (SELECT message_id, MAX(id) AS id FROM events GROUP BY message_id) latest
                ON latest.id = e.id
@@ -363,7 +402,7 @@ pub async fn get_message_events(
     let mut rows = conn
         .query(
             "SELECT installation_id, id, event, message_id, provider_message_id, client_ref, handle,
-                    chat_id, text, protocol, status, reason, timestamp, created_at
+                    chat_id, text, protocol, status, reason, timestamp, created_at, payload_json
              FROM events WHERE message_id = ?1 ORDER BY id ASC",
             params![message_id],
         )
@@ -374,24 +413,37 @@ pub async fn get_message_events(
 async fn read_journaled_events(rows: &mut libsql::Rows) -> Result<Vec<JournaledEvent>> {
     let mut events = Vec::new();
     while let Some(row) = rows.next().await? {
-        events.push(JournaledEvent {
-            installation_id: row.get(0)?,
-            id: row.get(1)?,
-            event: row.get(2)?,
-            message_id: row.get(3)?,
-            provider_message_id: row.get(4)?,
-            client_ref: row.get(5)?,
-            handle: row.get(6)?,
-            chat_id: row.get(7)?,
-            text: row.get(8)?,
-            protocol: row.get(9)?,
-            status: row.get(10)?,
-            reason: row.get(11)?,
-            timestamp: row.get(12)?,
-            created_at: row.get(13)?,
-        });
+        events.push(journaled_event_from_row(&row)?);
     }
     Ok(events)
+}
+
+fn journaled_event_from_row(row: &libsql::Row) -> Result<JournaledEvent> {
+    let payload_json: String = row.get(14)?;
+    let classification =
+        serde_json::from_str::<EventClassification>(&payload_json).unwrap_or_default();
+    Ok(JournaledEvent {
+        installation_id: row.get(0)?,
+        id: row.get(1)?,
+        event: row.get(2)?,
+        message_id: row.get(3)?,
+        provider_message_id: row.get(4)?,
+        client_ref: row.get(5)?,
+        handle: row.get(6)?,
+        destination_caller_id: classification.destination_caller_id,
+        chat_id: row.get(7)?,
+        thread_kind: classification.thread_kind,
+        participant_count: classification.participant_count,
+        membership_complete: classification.membership_complete,
+        classification_basis: classification.classification_basis,
+        classification_conflict: classification.classification_conflict,
+        text: row.get(8)?,
+        protocol: row.get(9)?,
+        status: row.get(10)?,
+        reason: row.get(11)?,
+        timestamp: row.get(12)?,
+        created_at: row.get(13)?,
+    })
 }
 
 async fn installation_id(conn: &Connection) -> Result<String> {
@@ -650,6 +702,7 @@ pub async fn record_failed(
     Ok(journaled)
 }
 
+#[cfg(test)]
 pub async fn record_unknown(
     conn: &Connection,
     job: &SendJob,
@@ -792,6 +845,7 @@ fn status_event(binding: &Binding, status: &str, timestamp: String) -> Event {
 }
 
 async fn insert_event_tx(tx: &libsql::Transaction, event: &Event) -> Result<JournaledEvent> {
+    validate_public_event(event)?;
     let installation_id = installation_id_tx(tx).await?;
     let payload_json = serde_json::to_string(event)?;
     let created_at = now_iso();
@@ -853,7 +907,13 @@ fn journaled_event(
         provider_message_id: event.provider_message_id.clone(),
         client_ref: event.client_ref.clone(),
         handle: event.handle.clone(),
+        destination_caller_id: event.destination_caller_id.clone(),
         chat_id: event.chat_id.clone(),
+        thread_kind: event.thread_kind.clone(),
+        participant_count: event.participant_count,
+        membership_complete: event.membership_complete,
+        classification_basis: event.classification_basis.clone(),
+        classification_conflict: event.classification_conflict,
         text: event.text.clone(),
         protocol: event.protocol.clone(),
         status: event.status.clone(),
@@ -942,8 +1002,19 @@ mod tests {
 
     fn event(message_id: &str, text: &str) -> Event {
         let mut ev = Event::new("message.received", message_id.to_string());
+        ev.provider_message_id = Some(message_id.to_string());
         ev.client_ref = Some("client-1".to_string());
         ev.handle = Some("+13055550123".to_string());
+        ev.destination_caller_id = Some("+16469921008".to_string());
+        ev.chat_id = Some("any;-;+13055550123".to_string());
+        ev.thread_kind = Some("direct".to_string());
+        ev.participant_count = Some(1);
+        ev.membership_complete = Some(true);
+        ev.classification_basis = Some(vec![
+            "participant_count:1".to_string(),
+            "chat_guid:direct".to_string(),
+        ]);
+        ev.classification_conflict = Some(false);
         ev.text = Some(text.to_string());
         ev.protocol = Some("imessage".to_string());
         ev
@@ -999,7 +1070,29 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, second.id);
         assert_eq!(events[0].text.as_deref(), Some("two"));
+        assert_eq!(
+            events[0].destination_caller_id.as_deref(),
+            Some("+16469921008")
+        );
+        assert_eq!(
+            second.destination_caller_id,
+            events[0].destination_caller_id
+        );
         assert_eq!(events[0].client_ref.as_deref(), Some("client-1"));
+        assert_eq!(events[0].thread_kind.as_deref(), Some("direct"));
+        assert_eq!(events[0].participant_count, Some(1));
+        assert_eq!(events[0].membership_complete, Some(true));
+        assert_eq!(
+            events[0].classification_basis.as_deref(),
+            Some(
+                [
+                    "participant_count:1".to_string(),
+                    "chat_guid:direct".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(events[0].classification_conflict, Some(false));
     }
 
     #[tokio::test]
@@ -1244,6 +1337,35 @@ mod tests {
         assert!(!recoverable
             .iter()
             .any(|send| matches!(send.job.message_id.as_str(), "bound" | "unknown")));
+    }
+
+    #[tokio::test]
+    async fn reopening_migrates_terminal_unknown_sends_back_to_retryable() {
+        let path = temp_db_path("unknown-retry-migration");
+        {
+            let store = Store::open(&path, "bsinst_test").await.unwrap();
+            let conn = store.conn().unwrap();
+            let job = send_job(
+                "previously-unknown",
+                None,
+                SendTarget::Handle {
+                    to: "+15550000001".to_string(),
+                },
+            );
+            accept_and_record_queued(&conn, &job).await.unwrap();
+            mark_dispatching(&conn, &job.message_id, 610259)
+                .await
+                .unwrap();
+            record_unknown(&conn, &job, "old terminal behavior")
+                .await
+                .unwrap();
+        }
+
+        let reopened = Store::open(&path, "bsinst_test").await.unwrap();
+        let recoverable = recoverable_sends(&reopened.conn().unwrap()).await.unwrap();
+        assert_eq!(recoverable.len(), 1);
+        assert_eq!(recoverable[0].job.message_id, "previously-unknown");
+        assert_eq!(recoverable[0].dispatch_state, "sent_unbound");
     }
 
     #[tokio::test]
