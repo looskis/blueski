@@ -52,10 +52,19 @@ pub fn router(state: AppState) -> Router {
         .route("/openapi.json", get(get_openapi))
         .route("/messages", get(get_messages).post(post_messages))
         .route("/messages/:id", get(get_message))
+        .route("/messages/:id/attachments", get(crate::attachments::list))
+        .route(
+            "/messages/:id/attachments/:attachment",
+            get(crate::attachments::download),
+        )
         .route("/events", get(get_events))
         .route("/events/stream", get(stream_events))
         .route("/healthz", get(get_health))
         .route("/status", get(get_status))
+        .route(
+            "/settings/default-sender",
+            get(get_default_sender).post(set_default_sender),
+        )
         .route("/debug/chatdb", get(get_debug_chatdb))
         .layer(middleware::from_fn_with_state(auth_config, require_auth))
         .with_state(state)
@@ -302,6 +311,7 @@ async fn stream_events(State(state): State<AppState>, Query(q): Query<EventsQuer
 
 async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     let webhooks = state.event_sink.webhook_statuses();
+    let receive_state = crate::config::State::load();
     Json(json!({
         "status": "ok",
         "product": "blueski",
@@ -313,12 +323,55 @@ async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
         "webhook_configured": !webhooks.is_empty(),
         "webhook_count": webhooks.len(),
         "webhooks": webhooks,
+        "inbound_enrichment": {
+            "pending": receive_state.pending_inbound.len(),
+            "quarantined": receive_state
+                .pending_inbound
+                .iter()
+                .filter(|pending| pending.quarantined_at.is_some())
+                .count(),
+        },
         "permissions": {
             "checked": state.permissions.checked(),
             "full_disk_access": state.permissions.full_disk_access(),
             "automation": state.permissions.automation(),
         }
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DefaultSenderRequest {
+    address: String,
+}
+
+async fn get_default_sender() -> Response {
+    default_sender_response(crate::default_sender::configure(None).await)
+}
+
+async fn set_default_sender(Json(request): Json<DefaultSenderRequest>) -> Response {
+    default_sender_response(crate::default_sender::configure(Some(&request.address)).await)
+}
+
+fn default_sender_response(
+    result: Result<crate::default_sender::DefaultSender, crate::default_sender::SettingsError>,
+) -> Response {
+    match result {
+        Ok(settings) => Json(settings).into_response(),
+        Err(error) => {
+            let status = match error.code {
+                "invalid_address" => StatusCode::BAD_REQUEST,
+                "sender_unavailable" => StatusCode::UNPROCESSABLE_ENTITY,
+                "settings_busy" => StatusCode::CONFLICT,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (
+                status,
+                Json(json!({"error": error.message, "code": error.code})),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -364,7 +417,19 @@ mod tests {
             .unwrap();
         let conn = store.conn().unwrap();
         let mut ev = Event::new("message.received", "msg-1".to_string());
+        ev.provider_message_id = Some("msg-1".to_string());
+        ev.handle = Some("+15550000001".to_string());
+        ev.chat_id = Some("any;-;+15550000001".to_string());
+        ev.thread_kind = Some("direct".to_string());
+        ev.participant_count = Some(1);
+        ev.membership_complete = Some(true);
+        ev.classification_basis = Some(vec![
+            "participant_count:1".to_string(),
+            "chat_guid:direct".to_string(),
+        ]);
+        ev.classification_conflict = Some(false);
         ev.text = Some("hello".to_string());
+        ev.protocol = Some("imessage".to_string());
         let saved = store::record_event(&conn, &ev).await.unwrap();
 
         let app = router(test_state(store).await);
@@ -384,6 +449,20 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, saved.id);
         assert_eq!(events[0].text.as_deref(), Some("hello"));
+        assert_eq!(events[0].thread_kind.as_deref(), Some("direct"));
+        assert_eq!(events[0].participant_count, Some(1));
+        assert_eq!(events[0].membership_complete, Some(true));
+        assert_eq!(
+            events[0].classification_basis.as_deref(),
+            Some(
+                [
+                    "participant_count:1".to_string(),
+                    "chat_guid:direct".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(events[0].classification_conflict, Some(false));
     }
 
     #[tokio::test]
@@ -557,6 +636,8 @@ mod tests {
             .starts_with("bsinst_"));
         assert_eq!(status["webhook_count"], 0);
         assert!(status["webhooks"].as_array().unwrap().is_empty());
+        assert!(status["inbound_enrichment"]["pending"].is_number());
+        assert!(status["inbound_enrichment"]["quarantined"].is_number());
     }
 
     #[tokio::test]
@@ -669,6 +750,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attachment_routes_enforce_message_ownership() {
+        let base = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(base.join("Attachments")).unwrap();
+        let photo = base.join("Attachments/photo.jpg");
+        std::fs::write(&photo, b"test photo").unwrap();
+        let path = base.join("chat.db");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE message(ROWID INTEGER PRIMARY KEY,guid TEXT,is_from_me INTEGER,service TEXT,destination_caller_id TEXT,handle_id INTEGER); CREATE TABLE handle(ROWID INTEGER PRIMARY KEY,id TEXT); CREATE TABLE chat(ROWID INTEGER PRIMARY KEY,guid TEXT); CREATE TABLE chat_message_join(chat_id INTEGER,message_id INTEGER); CREATE TABLE attachment(ROWID INTEGER PRIMARY KEY,filename TEXT,mime_type TEXT,total_bytes INTEGER); CREATE TABLE message_attachment_join(message_id INTEGER,attachment_id INTEGER); INSERT INTO message VALUES(1,'m1',0,'iMessage','+17185104786',1),(2,'m2',0,'iMessage','+16469921008',1); INSERT INTO handle VALUES(1,'+15555550123'); INSERT INTO chat VALUES(1,'iMessage;-;peer'); INSERT INTO chat_message_join VALUES(1,1),(1,2); INSERT INTO message_attachment_join VALUES(1,7),(2,8);").unwrap();
+        db.execute(
+            "INSERT INTO attachment VALUES(7,?1,'image/jpeg',10),(8,?1,'image/jpeg',10)",
+            [photo.to_str().unwrap()],
+        )
+        .unwrap();
+        drop(db);
+        let store = Store::open(base.join("journal.db").to_str().unwrap(), "bsinst_test")
+            .await
+            .unwrap();
+        let mut state = test_state(store).await;
+        state.chatdb = path;
+        let app = router(state);
+        for (url, status) in [
+            ("/messages/m1/attachments", StatusCode::OK),
+            ("/messages/m1/attachments/7", StatusCode::OK),
+            ("/messages/m1/attachments/8", StatusCode::NOT_FOUND),
+            ("/messages/unknown/attachments/7", StatusCode::NOT_FOUND),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{url}");
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
     async fn configured_bearer_token_protects_every_route() {
         let store = Store::open(&temp_db_path("auth-route"), "bsinst_test")
             .await
@@ -693,6 +811,18 @@ mod tests {
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
 
+        for url in [
+            "/messages/m1/attachments",
+            "/messages/m1/attachments/7",
+            "/settings/default-sender",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
         let allowed = app
             .oneshot(
                 Request::builder()
@@ -704,6 +834,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn default_sender_rejects_invalid_input_without_opening_settings() {
+        let store = Store::open(&temp_db_path("sender-invalid"), "bsinst_test")
+            .await
+            .unwrap();
+        let app = router(test_state(store).await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/settings/default-sender")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"address":"6469921008"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn default_sender_mutation_requires_configured_token() {
+        let store = Store::open(&temp_db_path("sender-auth"), "bsinst_test")
+            .await
+            .unwrap();
+        let mut state = test_state(store).await;
+        state.config = Arc::new(Config {
+            api_token: Some("test-secret".into()),
+            ..Config::default()
+        });
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/settings/default-sender")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"address":"+16469921008"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

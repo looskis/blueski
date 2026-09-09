@@ -378,10 +378,26 @@ fn secure_config_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingInbound {
+    pub rowid: i64,
+    pub guid: String,
+    pub first_seen_at: String,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
-    /// Highest `message.ROWID` we've already processed.
+    /// Highest `message.ROWID` durably captured by the receive worker.
     pub last_seen: i64,
+    /// Rows captured before Messages finished attaching identity/thread data.
+    #[serde(default)]
+    pub pending_inbound: Vec<PendingInbound>,
 }
 
 impl State {
