@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Push keep-alive
+
+- Add `blueski keepalive install|uninstall|status`. `install` (root) applies
+  kernel TCP keep-alive probes and loads a LaunchDaemon that reapplies them at
+  boot, so a NAT that drops apsd's idle push session is noticed within about
+  three minutes instead of apsd's own 20–30 minute keep-alive. Messages sent in
+  that window previously arrived late in a burst on reconnect.
+- `blueski doctor` reports the effective values under `push_keepalive`.
+
 ## 0.2.0 — 2026-09-09
 
 ### Receiving addresses and sender settings

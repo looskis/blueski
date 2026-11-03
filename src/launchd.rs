@@ -21,7 +21,7 @@ fn service(label: &str) -> String {
     format!("{}/{}", domain(), label)
 }
 
-fn xml_escape(value: &str) -> String {
+pub(crate) fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
