@@ -11,6 +11,13 @@
   that window previously arrived late in a burst on reconnect.
 - `blueski doctor` reports the effective values under `push_keepalive`.
 
+### Stable signing identity
+
+- `scripts/bundle.sh` signs with the keychain's Developer ID Application
+  identity by default and warns before falling back to ad-hoc, so Full Disk
+  Access and Automation grants survive rebuilds instead of being pinned to one
+  binary hash.
+
 ## 0.2.0 — 2026-09-09
 
 ### Receiving addresses and sender settings

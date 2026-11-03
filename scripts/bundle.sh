@@ -3,7 +3,14 @@
 # to a stable application identity during local development and releases.
 #
 # Usage: scripts/bundle.sh [debug|release]
-#   SIGN_ID=<identity>  codesign identity (default: ad-hoc)
+#   SIGN_ID=<identity>  codesign identity: a certificate SHA-1 or name, or "-"
+#                       for ad-hoc. Default: the longest-lived "Developer ID
+#                       Application" identity in the keychain, else ad-hoc.
+#
+# macOS pins Full Disk Access and Automation grants to the app's designated
+# requirement. A Developer ID signature pins them to the bundle identifier and
+# team, so every later build inherits the grants. An ad-hoc signature pins them
+# to the binary hash, so every rebuild must be granted again.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -12,8 +19,33 @@ BIN_NAME="blueski"
 APP_DISPLAY="Blueski"
 IDENTIFIER="com.looskis.blueski"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-SIGN_ID="${SIGN_ID:--}"
-LOGO="${LOGO:-assets/blueski-icon.png}"
+LOGO_DEFAULT=assets/blueski-icon.png
+
+# Pick the Developer ID Application certificate that expires last. Two copies
+# of the same name make a bare name ambiguous to codesign, so sign by hash.
+developer_id() {
+  local best="" best_exp=0 hash exp
+  while read -r hash; do
+    exp="$(security find-certificate -Z -p -c "Developer ID Application" -a 2>/dev/null \
+      | awk -v want="$hash" '/^SHA-1 hash:/{cur=$3} /BEGIN CERT/{c=1;buf=""} c{buf=buf $0 "\n"} /END CERT/{c=0; if(cur==want) printf "%s", buf}' \
+      | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//')"
+    [ -n "$exp" ] || continue
+    exp="$(date -j -f "%b %e %T %Y %Z" "$exp" +%s 2>/dev/null || echo 0)"
+    if [ "$exp" -gt "$best_exp" ]; then best="$hash"; best_exp="$exp"; fi
+  done < <(security find-identity -v -p codesigning 2>/dev/null \
+    | awk '/Developer ID Application/{print $2}')
+  printf '%s' "$best"
+}
+
+if [ -z "${SIGN_ID:-}" ]; then
+  SIGN_ID="$(developer_id)"
+  if [ -z "$SIGN_ID" ]; then
+    SIGN_ID="-"
+    echo "warning: no Developer ID Application identity found; signing ad-hoc." >&2
+    echo "warning: Full Disk Access and Automation grants will not survive the next build." >&2
+  fi
+fi
+LOGO="${LOGO:-$LOGO_DEFAULT}"
 ENTITLEMENTS="${ENTITLEMENTS:-assets/Blueski.entitlements}"
 
 APP="dist/${APP_DISPLAY}.app"
@@ -67,3 +99,8 @@ codesign --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_
 echo "built $APP (profile: $PROFILE, signed: $SIGN_ID)"
 echo "inner binary: $(pwd)/$CONTENTS/MacOS/$BIN_NAME"
 codesign -dv "$APP" 2>&1 | sed 's/^/  /' || true
+if [ "$SIGN_ID" = "-" ]; then
+  echo "  designated requirement is the binary hash: TCC grants are per build"
+else
+  echo "  designated requirement: $(codesign -d -r- "$APP" 2>&1 | sed -n 's/^designated => //p')"
+fi

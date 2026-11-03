@@ -68,9 +68,14 @@ Configuration and message history remain in `~/.config/blueski` so a reinstall
 can reuse them. Remove that directory separately only if you want to erase the
 local Blueski state.
 
-For local development, `scripts/bundle.sh` creates `dist/Blueski.app` with the
-Blueski icon and bundle identity. Set `SIGN_ID` to a stable signing identity if
-you want TCC grants to survive builds.
+`scripts/bundle.sh` creates `dist/Blueski.app` with the Blueski icon and bundle
+identity. It signs with the longest-lived "Developer ID Application" identity
+in the keychain, which pins Full Disk Access and Automation grants to the bundle
+identifier and team so later builds inherit them. Without one it signs ad-hoc
+and warns: macOS then pins the grants to the binary hash and every rebuild must
+be granted again. Set `SIGN_ID` to a certificate hash or name to choose, or to
+`-` for ad-hoc. Switching an installed app from ad-hoc to Developer ID changes
+its identity once, so that first build needs the grants once more.
 
 ## Use
 
