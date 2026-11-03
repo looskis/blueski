@@ -236,6 +236,21 @@ mod tests {
     }
 
     #[test]
+    fn plist_is_valid_property_list() {
+        let path = std::env::temp_dir().join(format!("{LABEL}.{}.plist", std::process::id()));
+        std::fs::write(&path, plist_contents()).unwrap();
+        let lint = Command::new("/usr/bin/plutil")
+            .args(["-lint", "-s"])
+            .arg(&path)
+            .status();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            lint.unwrap().success(),
+            "plutil rejected the LaunchDaemon plist"
+        );
+    }
+
+    #[test]
     fn parses_sysctl_output_and_judges_it() {
         let stock = Settings::parse("0\n7200000\n75000\n8\n").unwrap();
         assert!(!stock.effective());
