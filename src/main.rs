@@ -5,6 +5,7 @@ mod attachments;
 mod config;
 mod debug;
 mod default_sender;
+mod keepalive;
 mod launchd;
 mod model;
 mod permissions;
@@ -79,6 +80,11 @@ enum Command {
     Status,
     /// Run expensive live permission and service diagnostics.
     Doctor,
+    /// Keep Apple's push connection alive through NAT idle timeouts (needs sudo).
+    Keepalive {
+        #[command(subcommand)]
+        action: KeepaliveAction,
+    },
     /// Publish through a supervised ngrok tunnel with bearer authentication.
     Publish {
         /// Reserved ngrok hostname (for example blueski.example.com).
@@ -99,6 +105,16 @@ enum Command {
     Uninstall,
     /// Run the daemon in the foreground (launchd / `up` invoke this).
     Run,
+}
+
+#[derive(Subcommand)]
+enum KeepaliveAction {
+    /// Apply kernel TCP keep-alive probes now and at every boot.
+    Install,
+    /// Remove the LaunchDaemon and restore macOS defaults.
+    Uninstall,
+    /// Report the effective kernel values and worst-case detection time.
+    Status,
 }
 
 fn main() -> Result<()> {
@@ -122,6 +138,11 @@ fn main() -> Result<()> {
         Command::Down => down(),
         Command::Status => status(),
         Command::Doctor => doctor(),
+        Command::Keepalive { action } => match action {
+            KeepaliveAction::Install => keepalive::install(),
+            KeepaliveAction::Uninstall => keepalive::uninstall(),
+            KeepaliveAction::Status => keepalive::status(),
+        },
         Command::Publish { domain } => publish(domain),
         Command::Unpublish => unpublish(),
         Command::Setup { app_launched } => setup(app_launched),
@@ -583,7 +604,8 @@ fn doctor() -> Result<()> {
         "permissions": {
             "full_disk_access": permissions::has_full_disk_access(&config::chatdb_path()),
             "automation": permissions::has_automation(),
-        }
+        },
+        "push_keepalive": keepalive::status_json(),
     });
     print_status(&serde_json::to_string(&report)?);
     Ok(())

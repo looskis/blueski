@@ -231,6 +231,37 @@ State lives in the same directory:
 LaunchAgent logs are written to `blueski.log` and `blueski.err.log` in the same
 state directory.
 
+## Late messages behind NAT
+
+iMessage reaches the Mac over apsd's long-lived TCP session to Apple's push
+service. apsd grows its own keep-alive to 20–30 minutes, so when a router or
+carrier NAT drops the idle flow, the Mac stays deaf until that keep-alive fails
+and every message sent meanwhile arrives in a burst on reconnect. Blueski sees
+the row the moment it lands in `chat.db`, so the symptom is a reply that takes
+minutes with nothing in Blueski's log before it. The macOS log shows the cause:
+
+```sh
+log show --last 6h --predicate 'process == "imagent" AND eventMessage CONTAINS "APS Connection status"'
+```
+
+Blueski cannot own that socket, but the kernel can probe every idle TCP
+connection. Probes refresh the NAT mapping and, when the session is already
+dead, surface the error within about three minutes so apsd reconnects at once:
+
+```sh
+sudo blueski keepalive install
+blueski keepalive status
+sudo blueski keepalive uninstall
+```
+
+`install` sets `net.inet.tcp.always_keepalive=1`, `keepidle=120000`,
+`keepintvl=15000`, and `keepcnt=4`, and loads
+`/Library/LaunchDaemons/com.looskis.blueski.keepalive.plist` to reapply them at
+boot. The settings are machine-wide and cost a few bytes per idle connection
+every two minutes. `blueski doctor` reports them under `push_keepalive`;
+`effective: false` means the Mac can still miss messages for up to two hours.
+`uninstall` restores the macOS defaults.
+
 ## Development and verification
 
 ```sh
